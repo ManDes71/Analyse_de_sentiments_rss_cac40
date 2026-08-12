@@ -1,6 +1,6 @@
-# market-rss-sentiment
+# Analyse de sentiments appliquée à des flux rss boursiers
 
-**`market-rss-sentiment`** est un pipeline d'IA bout en bout conçu pour automatiser la veille financière et la notation de sentiment d'entreprises à partir de flux de presse (RSS).
+**`Analyse_de_sentiments_rss_cac40`** est un pipeline d'IA bout en bout conçu pour automatiser la veille financière et la notation de sentiment d'entreprises à partir de flux de presse (RSS).
 
 Face aux limites des approches génératives globales (coûts API, latence, faux positifs), le projet met en œuvre une **architecture hybride et ciblée** :
 
