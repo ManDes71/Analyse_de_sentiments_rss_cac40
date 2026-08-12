@@ -92,6 +92,98 @@ Ce dépôt alimente la série d'articles **Market-RSS-Sentiment** sur [aventures
 - Qwen 2.5 produit occasionnellement des notes hors du domaine `{0,1,2}`, validées et rejetées explicitement plutôt qu'insérées telles quelles.
 - Prochaine étape : évaluer un Transformer spécialisé en finance pour réduire le coût de calcul par rapport à un LLM généraliste 8B.
 
+# Schéma de la base de données — REMOVED
+
+```mermaid
+erDiagram
+    RSS_FEEDS ||--o{ ARTICLES_RSS : "alimente"
+    ARTICLES_RSS ||--o{ ARTICLE_COMPANIES : "mentionne"
+    COMPANIES ||--o{ ARTICLE_COMPANIES : "est mentionnée dans"
+    ARTICLES_RSS ||--o{ ARTICLE_SECTORS : "concerne"
+    SECTORS ||--o{ ARTICLE_SECTORS : "regroupe"
+    COMPANIES ||--o{ COMPANY_ALIASES : "a pour alias"
+    SECTORS ||--o{ SECTOR_ALIASES : "a pour alias"
+    SECTORS ||--o{ COMPANIES : "classe"
+
+    RSS_FEEDS {
+        int id PK
+        text name
+        text url UK
+        text source_domain
+        bool enabled
+    }
+
+    ARTICLES_RSS {
+        int id PK
+        text titre
+        text lien
+        date published_at
+        int feed_id FK
+        char unique_hash UK
+        timestamptz companies_tagged_at
+    }
+
+    COMPANIES {
+        int id PK
+        text name UK
+        text isin UK
+        text ticker
+        text country
+        int sector_id FK
+    }
+
+    SECTORS {
+        int id PK
+        text name UK
+    }
+
+    ARTICLE_COMPANIES {
+        int article_id PK_FK
+        int company_id PK_FK
+        int nbocc
+        int note_tfidf
+        int note_full
+        int note_targeted
+        int note_llama3
+        int note_mistral
+        int note_queen
+        int note_gemini
+        int note_haiku
+        varchar statut_gemini
+        varchar statut_haiku
+        varchar statut_lama
+        varchar statut_mistral
+        varchar statut_queen
+    }
+
+    ARTICLE_SECTORS {
+        int article_id PK_FK
+        int sector_id PK_FK
+    }
+
+    COMPANY_ALIASES {
+        int id PK
+        int company_id FK
+        citext alias
+        text alias_norm
+    }
+
+    SECTOR_ALIASES {
+        int id PK
+        int sector_id FK
+        citext alias
+        text alias_norm
+    }
+```
+
+## Notes
+
+- **`article_companies`** est la table centrale du pipeline : clé composite `(article_id, company_id)`, elle porte à la fois le comptage d'occurrences (`nbocc`), les notes de classification (`note_tfidf`, `note_full`, `note_targeted`) et les 5 notes LLM avec leur statut d'évaluation et leur version de prompt — une ligne = un couple (article, entreprise) entièrement tracé.
+- **Suppression en cascade** : `article_companies`, `article_sectors` et `company_aliases`/`sector_aliases` sont en `ON DELETE CASCADE` sur leur article/entreprise/secteur parent — supprimer un article ou une entreprise nettoie automatiquement les tables pivot.
+- **`sector_id` sur `companies`** est en `ON DELETE SET NULL` : supprimer un secteur ne supprime pas les entreprises, il les détache juste.
+- **Recherche plein texte** : `articles_rss` a un index GIN sur `to_tsvector('french', titre || contenu)` pour la recherche full-text.
+- **Normalisation des alias** : les colonnes `alias_norm` de `company_aliases`/`sector_aliases` sont remplies automatiquement par trigger (`lower(alias)`), avec un index unique `(company_id, alias_norm)` pour éviter les doublons insensibles à la casse.
+
 ## Licence & auteur
 
 Auteur : [ManDes71](https://github.com/ManDes71) — *licence à préciser dans le dépôt.*
