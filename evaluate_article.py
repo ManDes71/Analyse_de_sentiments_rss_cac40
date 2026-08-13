@@ -13,27 +13,6 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, ValidationError
 
-##{nom llm;nom modele;type d'API;nom fichier CSV;colonne tableau de résultats}
-#{gemini;gemini-2.5-flash;API Distante;output/resultats_gemini_{date_jour}.csv; note_gemini}
-#{haiku;claude-haiku-4-5;API Distante;output/resultats_haiku_{date_jour}.csv; note_haiku}
-#{lama;llama3;API locale Ollama;output/resultats_lama_{date_jour}.csv; note_llama3}
-#{mistral;mistral-nemo;API locale Ollama;output/resultats_mistral_{date_jour}.csv; note_mistral}
-#{queen;qwen2.5:7b;API locale Ollama;output/resultats_queen_{date_jour}.csv; note_queen}
-#
-# ==========================================
-# MIGRATION BDD REQUISE (à exécuter une seule fois avant d'utiliser ce script) :
-#
-#   ALTER TABLE public.article_companies ADD COLUMN statut_gemini  varchar(20) DEFAULT 'not_evaluated';
-#   ALTER TABLE public.article_companies ADD COLUMN statut_haiku   varchar(20) DEFAULT 'not_evaluated';
-#   ALTER TABLE public.article_companies ADD COLUMN statut_lama    varchar(20) DEFAULT 'not_evaluated';
-#   ALTER TABLE public.article_companies ADD COLUMN statut_mistral varchar(20) DEFAULT 'not_evaluated';
-#   ALTER TABLE public.article_companies ADD COLUMN statut_queen   varchar(20) DEFAULT 'not_evaluated';
-#
-#   ALTER TABLE public.article_companies ADD COLUMN prompt_version_gemini  varchar(10);
-#   ALTER TABLE public.article_companies ADD COLUMN prompt_version_haiku   varchar(10);
-#   ALTER TABLE public.article_companies ADD COLUMN prompt_version_lama    varchar(10);
-#   ALTER TABLE public.article_companies ADD COLUMN prompt_version_mistral varchar(10);
-#   ALTER TABLE public.article_companies ADD COLUMN prompt_version_queen   varchar(10);
 #
 # Valeurs possibles pour statut_* : 'not_evaluated' (jamais soumis, ex. filtré par
 # nb_occ <= 1), 'ok' (note/justification fiables), 'failed' (appel tenté, jamais
