@@ -1,4 +1,4 @@
-# Analyse de sentiment CAC 40 par LLM
+# Analyse de sentiment du CAC 40 par LLM
 
 Pipeline d'evaluation du sentiment financier d'articles RSS par cinq modeles de
 langage (deux API distantes, trois modeles locaux), avec comparaison de leurs
