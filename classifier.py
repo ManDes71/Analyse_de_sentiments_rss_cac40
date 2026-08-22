@@ -44,8 +44,8 @@ nltk.download("punkt_tab", quiet=True)
 DB_HOST     = os.getenv("DB_HOST",     "localhost")
 DB_PORT     = int(os.getenv("DB_PORT", "5432"))
 DB_NAME     = os.getenv("DB_NAME",     "REMOVED")
-DB_USER     = os.getenv("DB_USER",     "REMOVED")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "REMOVED")
+DB_USER     = os.getenv("DB_USER",     "user")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "mdp")
 
 TODAY = date.today()
 NBOCC_MIN = 2
