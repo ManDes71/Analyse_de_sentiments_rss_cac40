@@ -23,9 +23,9 @@ from psycopg2.extras import RealDictCursor
 
 DB_HOST     = os.getenv("DB_HOST",     "localhost")
 DB_PORT     = int(os.getenv("DB_PORT", "5432"))
-DB_NAME     = os.getenv("DB_NAME",     "REMOVED")
-DB_USER     = os.getenv("DB_USER",     "user")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "mdp")
+DB_USER     = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
+DB_NAME     = os.getenv("DB_NAME", "finance_db")
 
 TODAY = date.today()
 
