@@ -363,7 +363,7 @@ def analyser_par_entreprise(df, seuil_mini=15, top_n=10):
     print("  problème d'alias/de détection d'entité qu'une faiblesse du modèle.")
 
 
-def exporter_zone_grise(zone_grise, chemin="zone_grise_a_annoter.csv", taille=100):
+def exporter_zone_grise(zone_grise, chemin="zone_grise_gemini_a_annoter.csv", taille=100):
     """
     Exporte un échantillon stratifié de la zone grise pour annotation REMOVEDelle.
     C'est la seule façon de transformer ce benchmark d'un simple "accord
@@ -385,15 +385,6 @@ def exporter_zone_grise(zone_grise, chemin="zone_grise_a_annoter.csv", taille=10
     echantillon = zone_grise.loc[index_retenus]
 
     colonnes_export = ["article_id", "company_id"]
-
-    # Ajouter lien si disponible
-    if "lien" in echantillon.columns:
-        colonnes_export.append("lien")
-    elif "url" in echantillon.columns:
-        colonnes_export.append("url")
-    elif "link" in echantillon.columns:
-        colonnes_export.append("link")
-
     if "nbocc" in echantillon.columns:
         colonnes_export.append("nbocc")
     colonnes_export += [BASELINE, REFERENCE_SECONDAIRE] + MODELES_LOCAUX
@@ -403,116 +394,10 @@ def exporter_zone_grise(zone_grise, chemin="zone_grise_a_annoter.csv", taille=10
 
     export = echantillon[colonnes_export].copy()
     export["note_humaine"] = ""  # colonne à remplir à la main (0, 1 ou 2)
-
-    # Créer version HTML avec liens cliquables
-    export_html = export.copy()
-    if "lien" in export_html.columns:
-        export_html["lien"] = export_html["lien"].apply(
-            lambda x: f'<a href="{x}" target="_blank">🔗 Lire</a>' if pd.notna(x) and x != "" else ""
-        )
-    elif "url" in export_html.columns:
-        export_html["url"] = export_html["url"].apply(
-            lambda x: f'<a href="{x}" target="_blank">🔗 Lire</a>' if pd.notna(x) and x != "" else ""
-        )
-    elif "link" in export_html.columns:
-        export_html["link"] = export_html["link"].apply(
-            lambda x: f'<a href="{x}" target="_blank">🔗 Lire</a>' if pd.notna(x) and x != "" else ""
-        )
-
-    # Exporter CSV (Excel lisible)
     export.to_csv(chemin, index=False, encoding="utf-8")
-
-    # Exporter HTML (avec liens cliquables)
-    chemin_html = chemin.replace(".csv", ".html")
-    html_table = export_html.to_html(escape=False, index=False)
-    html_complet = f"""<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Zone Grise à Annoter</title>
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #f5f5f5;
-            padding: 20px;
-        }}
-        .container {{
-            max-width: 1400px;
-            margin: 0 auto;
-            background: white;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }}
-        h1 {{
-            color: #333;
-            margin-bottom: 10px;
-        }}
-        .info {{
-            background: #e3f2fd;
-            border-left: 4px solid #2196F3;
-            padding: 15px;
-            margin-bottom: 20px;
-            border-radius: 4px;
-        }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-        }}
-        th {{
-            background: #2196F3;
-            color: white;
-            padding: 12px;
-            text-align: left;
-            font-weight: 600;
-            border: 1px solid #ddd;
-        }}
-        td {{
-            padding: 12px;
-            border: 1px solid #ddd;
-        }}
-        tr:nth-child(even) {{
-            background: #f9f9f9;
-        }}
-        tr:hover {{
-            background: #f0f0f0;
-        }}
-        a {{
-            color: #2196F3;
-            text-decoration: none;
-            font-weight: 500;
-        }}
-        a:hover {{
-            text-decoration: underline;
-        }}
-        .note-input {{
-            width: 80px;
-            padding: 5px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔍 Zone Grise à Annoter</h1>
-        <div class="info">
-            <strong>Instructions:</strong> Consultez chaque article via le lien URL, puis remplissez la colonne "note_humaine" avec votre jugement (0=Négatif, 1=Neutre, 2=Positif).
-            Cela permettra de déterminer si la baseline est juste ou si elle se trompe.
-        </div>
-        {html_table}
-    </div>
-</body>
-</html>
-"""
-    with open(chemin_html, "w", encoding="utf-8") as f:
-        f.write(html_complet)
-
-    print(f"\n[Export] {len(export)} cas ambigus exportés vers '{chemin}' (CSV) et '{chemin_html}' (HTML).")
-    print("  Fichier HTML : ouvre-le dans le navigateur pour accéder aux articles via les liens.")
-    print("  Fichier CSV : importe-le dans Excel pour annoter facilement la colonne 'note_humaine'.")
+    print(f"\n[Export] {len(export)} cas ambigus exportés vers '{chemin}'.")
+    print("  Remplir la colonne 'note_humaine' permettra de déterminer laquelle des")
+    print("  deux références est la plus juste, et de corriger le classement final.")
 
 
 # ==========================================
@@ -552,219 +437,6 @@ def tracer_graphiques(acc_scores, distrib):
     plt.close()
 
     print("\nGraphiques sauvegardés : 'taux_accord_modeles.png' et 'distribution_biais.png'")
-
-
-def generer_html_rapport(acc_scores, distrib):
-    """
-    Génère un fichier HTML avec les graphiques et statistiques du benchmark.
-    """
-    html_content = f"""<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Benchmark Classification LLM</title>
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px;
-            min-height: 100vh;
-        }}
-        .container {{
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            overflow: hidden;
-        }}
-        header {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 40px 30px;
-            text-align: center;
-        }}
-        header h1 {{
-            font-size: 2.5em;
-            margin-bottom: 10px;
-        }}
-        header p {{
-            font-size: 1.1em;
-            opacity: 0.9;
-        }}
-        .content {{
-            padding: 40px 30px;
-        }}
-        .section {{
-            margin-bottom: 50px;
-        }}
-        .section h2 {{
-            font-size: 1.8em;
-            color: #333;
-            margin-bottom: 20px;
-            border-bottom: 3px solid #667eea;
-            padding-bottom: 10px;
-        }}
-        .section h3 {{
-            font-size: 1.3em;
-            color: #555;
-            margin-top: 25px;
-            margin-bottom: 15px;
-        }}
-        .graphs {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 30px;
-            margin-bottom: 40px;
-        }}
-        .graph-container {{
-            text-align: center;
-            background: #f9f9f9;
-            padding: 20px;
-            border-radius: 8px;
-            border: 1px solid #e0e0e0;
-        }}
-        .graph-container img {{
-            max-width: 100%;
-            height: auto;
-            border-radius: 6px;
-        }}
-        .graph-container p {{
-            margin-top: 15px;
-            font-size: 0.95em;
-            color: #666;
-        }}
-        .stats-table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin: 20px 0;
-            background: white;
-        }}
-        .stats-table th {{
-            background: #667eea;
-            color: white;
-            padding: 12px;
-            text-align: left;
-            font-weight: 600;
-        }}
-        .stats-table td {{
-            padding: 12px;
-            border-bottom: 1px solid #e0e0e0;
-        }}
-        .stats-table tr:hover {{
-            background: #f5f5f5;
-        }}
-        .baseline-info {{
-            background: #e3f2fd;
-            border-left: 4px solid #667eea;
-            padding: 15px;
-            margin: 20px 0;
-            border-radius: 4px;
-        }}
-        .baseline-info strong {{
-            color: #667eea;
-        }}
-        footer {{
-            background: #f5f5f5;
-            padding: 20px 30px;
-            text-align: center;
-            color: #666;
-            border-top: 1px solid #e0e0e0;
-        }}
-        @media (max-width: 800px) {{
-            .graphs {{
-                grid-template-columns: 1fr;
-            }}
-            header h1 {{
-                font-size: 1.8em;
-            }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>📊 Benchmark Classification LLM</h1>
-            <p>Comparaison des modèles contre {NOMS_PROPRES[BASELINE]}</p>
-        </header>
-
-        <div class="content">
-            <div class="baseline-info">
-                <strong>📌 Baseline :</strong> {NOMS_PROPRES[BASELINE]}<br>
-                <strong>📌 Référence secondaire :</strong> {NOMS_PROPRES[REFERENCE_SECONDAIRE]}<br>
-                <strong>📌 Modèles locaux évalués :</strong> {", ".join([NOMS_PROPRES[m] for m in MODELES_LOCAUX])}
-            </div>
-
-            <div class="section">
-                <h2>📈 Visualisations</h2>
-                <div class="graphs">
-                    <div class="graph-container">
-                        <h3>Taux d'accord</h3>
-                        <img src="taux_accord_modeles.png" alt="Taux d'accord des modèles">
-                        <p>Pourcentage d'accord exact avec la baseline {NOMS_PROPRES[BASELINE]}</p>
-                    </div>
-                    <div class="graph-container">
-                        <h3>Distribution des notes</h3>
-                        <img src="distribution_biais.png" alt="Distribution des notes">
-                        <p>Biais de prudence : comment chaque modèle distribue les sentiments</p>
-                    </div>
-                </div>
-            </div>
-
-            <div class="section">
-                <h2>📊 Résumé des scores</h2>
-                <table class="stats-table">
-                    <thead>
-                        <tr>
-                            <th>Modèle</th>
-                            <th>Taux d'accord (%)</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-"""
-
-    for modele, score in acc_scores.items():
-        html_content += f"                        <tr><td>{modele}</td><td>{score:.2f}%</td></tr>\n"
-
-    html_content += f"""                    </tbody>
-                </table>
-            </div>
-
-            <div class="section">
-                <h2>📌 À propos</h2>
-                <p>Ce benchmark compare les modèles LLM locaux (Llama, Mistral, Qwen) contre:</p>
-                <ul style="margin-left: 20px; margin-top: 10px; line-height: 1.8;">
-                    <li><strong>Baseline primaire :</strong> {NOMS_PROPRES[BASELINE]} (référence principale)</li>
-                    <li><strong>Baseline secondaire :</strong> {NOMS_PROPRES[REFERENCE_SECONDAIRE]} (pour identifier la zone grise)</li>
-                </ul>
-                <p style="margin-top: 15px;">
-                    Les modèles sont évalués sur leur capacité à classer les articles en trois catégories:
-                    <strong>Négatif (0)</strong>, <strong>Neutre (1)</strong>, <strong>Positif (2)</strong>.
-                </p>
-            </div>
-        </div>
-
-        <footer>
-            <p>Rapport généré automatiquement par benchmark_classification.py</p>
-            <p style="margin-top: 10px; font-size: 0.9em; color: #999;">
-                📁 Fichiers sources: taux_accord_modeles.png, distribution_biais.png
-            </p>
-        </footer>
-    </div>
-</body>
-</html>
-"""
-
-    with open("benchmark_rapport.html", "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-    print(f"\n✅ Rapport HTML généré : 'benchmark_rapport.html'")
 
 
 # ==========================================
@@ -813,7 +485,6 @@ def analyser_benchmark_llm(csv_path="benchmark_classification_V2.csv"):
     exporter_zone_grise(zone_grise)
 
     tracer_graphiques(acc_scores, distrib)
-    generer_html_rapport(acc_scores, distrib)
 
 
 if __name__ == "__main__":
