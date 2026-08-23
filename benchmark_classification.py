@@ -358,7 +358,7 @@ def analyser_par_entreprise(df, seuil_mini=15, top_n=10):
     print("  problème d'alias/de détection d'entité qu'une faiblesse du modèle.")
 
 
-def exporter_zone_grise(zone_grise, chemin="zone_grise_a_annoter.csv", taille=100):
+def exporter_zone_grise(zone_grise, chemin="output/zone_grise_a_annoter.csv", taille=100):
     """
     Exporte un échantillon stratifié de la zone grise pour annotation REMOVEDelle.
     C'est la seule façon de transformer ce benchmark d'un simple "accord
