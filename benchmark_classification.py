@@ -1,8 +1,3 @@
-#C:\Users\DESPLANCHES\Documents\CODES\WINDEV\REMOVED\post blog
-#mon_env\Scripts\activate
-#python -m pip install scikit-learn
-#python benchmark_classification.py
-
 import os
 import re
 
@@ -63,7 +58,7 @@ def filtrer_par_version(df, nom_fichier):
         print("ATTENTION : aucune version détectée dans le nom du fichier.")
         print("  L'analyse va porter sur TOUTES les versions de prompt présentes,")
         print("  donc mélanger des notes non comparables. Nommez le fichier")
-        print("  'benchmark_classification_V4.csv' pour filtrer sur la v4.")
+        print("  '_V4.csv' pour filtrer sur la v4.")
         return df
 
     cible = f"v{correspondance.group(1)}"
@@ -751,7 +746,7 @@ def generer_html_rapport(acc_scores, distrib):
         </div>
 
         <footer>
-            <p>Rapport généré automatiquement par benchmark_classification.py</p>
+            <p>Rapport généré automatiquement par .py</p>
             <p style="margin-top: 10px; font-size: 0.9em; color: #999;">
                 📁 Fichiers sources: taux_accord_modeles.png, distribution_biais.png
             </p>
@@ -770,7 +765,7 @@ def generer_html_rapport(acc_scores, distrib):
 # ==========================================
 # POINT D'ENTRÉE
 # ==========================================
-def analyser_benchmark_llm(csv_path="benchmark_classification_V2.csv"):
+def analyser_benchmark_llm(csv_path="output/benchmark_classification_V2.csv"):
     if not os.path.exists(csv_path):
         print(f"Fichier {csv_path} introuvable.")
         return
