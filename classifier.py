@@ -24,11 +24,16 @@ Vous pourriez envisager une note composite :
 note_composite = round((note_tfidf + note_full) / 2)
 
 Ou utiliser la divergence comme indicateur d'incertitude du modèle.
+
+source .venv/bin/activate
+python3 classifier.py --subset-csv output/benchmark_classification_V7.csv 15
+python3 classifier.py --subset-csv output/benchmark_classification_V7.csv
+python3 benchmark_classification_tfidf.py
 """
 
 import os
-import sys
 import csv
+import argparse
 from datetime import date
 
 import nltk
@@ -37,15 +42,20 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+from dotenv import load_dotenv
 import torch
 
 nltk.download("punkt_tab", quiet=True)
+
+# Charger les variables d'environnement depuis .env
+load_dotenv()
 
 DB_HOST     = os.getenv("DB_HOST",     "localhost")
 DB_PORT     = int(os.getenv("DB_PORT", "5432"))
 DB_USER     = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 DB_NAME     = os.getenv("DB_NAME", "finance_db")
+
 
 TODAY = date.today()
 NBOCC_MIN = 2
@@ -208,20 +218,43 @@ def extraire_contexte_cible(texte, nom_entreprise):
     phrases_cibles = [phrases[i] for i in sorted(index_a_garder)]
     return " ".join(phrases_cibles)
 
-def traiter_entreprise(cur, company_id: int, company_name: str, sentiment_pipeline, tokenizer_gpu=None, model_gpu=None, mapping_gpu=None, csv_rows: list | None = None) -> int:
-    """Analyse et met à jour les articles éligibles (nbocc > NBOCC_MIN)."""
+def traiter_entreprise(cur, company_id: int, company_name: str, sentiment_pipeline, tokenizer_gpu=None, model_gpu=None, mapping_gpu=None, csv_rows: list | None = None, article_ids_filtres: set[int] | None = None, compteur_ignores: dict | None = None) -> int:
+    """Analyse et met à jour les articles éligibles (nbocc > NBOCC_MIN, ou article_ids_filtres si fourni).
 
-    cur.execute(
-        """
-        SELECT ac.article_id, a.titre, a.contenu
-        FROM public.article_companies ac
-        JOIN public.articles_rss a ON a.id = ac.article_id
-        WHERE ac.company_id = %s
-          AND ac.nbocc > %s
-        ORDER BY a.published_at DESC NULLS LAST
-        """,
-        (company_id, NBOCC_MIN),
-    )
+    Args:
+        article_ids_filtres: si fourni, ne traiter que ces article_id (pour le mode subset).
+                            Ne PAS filtrer sur nbocc dans ce cas (cf. plan, constat 3).
+        compteur_ignores: dict pour tracker le nombre d'articles ignorés (texte vide, etc.)
+    """
+
+    if article_ids_filtres is not None:
+        # Mode subset : filtrer sur les paires exactes (article_id, company_id) du CSV V7
+        # SANS condition sur nbocc (le nbocc courant en base peut différer du nbocc au moment
+        # de l'évaluation LLM, donc on suit strictement le périmètre V7)
+        cur.execute(
+            """
+            SELECT ac.article_id, a.titre, a.contenu
+            FROM public.article_companies ac
+            JOIN public.articles_rss a ON a.id = ac.article_id
+            WHERE ac.company_id = %s
+              AND ac.article_id = ANY(%s)
+            ORDER BY a.published_at DESC NULLS LAST
+            """,
+            (company_id, list(article_ids_filtres)),
+        )
+    else:
+        # Mode standard : filtrer sur nbocc > NBOCC_MIN
+        cur.execute(
+            """
+            SELECT ac.article_id, a.titre, a.contenu
+            FROM public.article_companies ac
+            JOIN public.articles_rss a ON a.id = ac.article_id
+            WHERE ac.company_id = %s
+              AND ac.nbocc > %s
+            ORDER BY a.published_at DESC NULLS LAST
+            """,
+            (company_id, NBOCC_MIN),
+        )
     articles = cur.fetchall()
 
     nb_maj = 0
@@ -230,6 +263,8 @@ def traiter_entreprise(cur, company_id: int, company_name: str, sentiment_pipeli
         contenu = art["contenu"] or ""
         texte_brut = f"{art['titre'] or ''} {art['contenu'] or ''}".strip()
         if not texte_brut:
+            if compteur_ignores is not None:
+                compteur_ignores["texte_vide"] += 1
             continue
 
         # Vérification de la nature de l'article
@@ -246,7 +281,10 @@ def traiter_entreprise(cur, company_id: int, company_name: str, sentiment_pipeli
 
             # Analyse sur le texte brut
             _, note_full, _ = analyser_sentiment_finance(texte_brut, sentiment_pipeline)
-            note_targeted = 9  # Pour les articles dédiés, on elimine le sentiment ciblé
+            # Note: note_targeted = 9 est une SENTINELLE (pas une note valide {0,1,2})
+            # pour les articles dédiés, le sentiment ciblé n'est pas calculé.
+            # Cette valeur doit être filtrée en aval (ex. dans les scripts de benchmark).
+            note_targeted = 9
 
             # Analyse GPU sur le texte brut (comparaison uniquement, non utilisée pour la BDD)
             if tokenizer_gpu is not None and model_gpu is not None:
@@ -335,8 +373,52 @@ def traiter_entreprise(cur, company_id: int, company_name: str, sentiment_pipeli
     return nb_maj
 
 
+def charger_subset_csv(csv_path):
+    """
+    Charge un CSV de benchmark (ex. benchmark_classification_V7.csv)
+    et retourne un dict company_id -> set[article_id] pour filtrer le traitement.
+    """
+    subset_dict = {}
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            company_id = int(row["company_id"])
+            article_id = int(row["article_id"])
+            if company_id not in subset_dict:
+                subset_dict[company_id] = set()
+            subset_dict[company_id].add(article_id)
+    return subset_dict
+
+
 def main():
-    company_id_filtre = int(sys.argv[1]) if len(sys.argv) > 1 else None
+    parser = argparse.ArgumentParser(
+        description="Analyse le sentiment TF-IDF+finance des articles financiers.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemples :
+  python classifier.py                    # Traite toutes les entreprises, nbocc > 2
+  python classifier.py 15                 # Traite TotalEnergies (id=15) uniquement, nbocc > 2
+  python classifier.py --subset-csv output/benchmark_classification_V7.csv
+                                          # Traite seulement les couples (article, company) de V7
+  python classifier.py --subset-csv output/benchmark_classification_V7.csv 15
+                                          # Traite seulement TotalEnergies du subset V7
+        """
+    )
+    parser.add_argument("company_id", nargs="?", type=int, default=None,
+                        help="Optionnel : ID de l'entreprise à traiter seule")
+    parser.add_argument("--subset-csv", type=str, default=None,
+                        help="Optionnel : chemin du CSV de benchmark pour filtrer le périmètre")
+
+    args = parser.parse_args()
+    company_id_filtre = args.company_id
+    subset_csv = args.subset_csv
+
+    # Charger le subset si fourni
+    subset_dict = None
+    if subset_csv:
+        print(f"Chargement du subset depuis {subset_csv}...")
+        subset_dict = charger_subset_csv(subset_csv)
+        print(f"  → {len(subset_dict)} entreprise(s) trouvée(s) dans le subset.")
 
     MODEL_NAME = "bardsai/finance-sentiment-fr-base"
 
@@ -369,15 +451,39 @@ def main():
     with conn:
         with conn.cursor() as cur:
 
-            if company_id_filtre:
-                cur.execute(
-                    "SELECT id, name FROM public.companies WHERE id = %s",
-                    (company_id_filtre,),
-                )
-            else:
-                cur.execute("SELECT id, name FROM public.companies ORDER BY id")
+            # Déterminer quelles entreprises traiter
+            if subset_dict is not None:
+                # Mode subset : itérer sur les entreprises du subset
+                if company_id_filtre and company_id_filtre not in subset_dict:
+                    print(f"Entreprise {company_id_filtre} absente du subset.")
+                    return
 
-            companies = cur.fetchall()
+                company_ids_a_traiter = []
+                if company_id_filtre:
+                    # Filtrer sur une seule entreprise du subset
+                    company_ids_a_traiter = [company_id_filtre]
+                else:
+                    # Toutes les entreprises du subset
+                    company_ids_a_traiter = sorted(subset_dict.keys())
+
+                # Charger les noms des entreprises
+                placeholders = ",".join(["%s"] * len(company_ids_a_traiter))
+                cur.execute(
+                    f"SELECT id, name FROM public.companies WHERE id IN ({placeholders}) ORDER BY id",
+                    company_ids_a_traiter
+                )
+                companies = cur.fetchall()
+            else:
+                # Mode standard : toutes les entreprises en base
+                if company_id_filtre:
+                    cur.execute(
+                        "SELECT id, name FROM public.companies WHERE id = %s",
+                        (company_id_filtre,),
+                    )
+                else:
+                    cur.execute("SELECT id, name FROM public.companies ORDER BY id")
+
+                companies = cur.fetchall()
 
             if not companies:
                 print("Aucune entreprise trouvée.")
@@ -385,18 +491,39 @@ def main():
 
             total_maj = 0
             csv_rows = []
+            compteur_ignores = {"texte_vide": 0}
+
             for company in companies:
                 print(f"[{company['id']:>4}] {company['name']}")
-                nb = traiter_entreprise(cur, company["id"], company["name"], sentiment_pipeline, tokenizer_gpu, model_gpu, mapping_gpu, csv_rows)
+
+                article_ids_filtres = None
+                if subset_dict is not None:
+                    article_ids_filtres = subset_dict[company["id"]]
+                    print(f"         Subset : {len(article_ids_filtres)} article(s)")
+
+                nb = traiter_entreprise(
+                    cur, company["id"], company["name"],
+                    sentiment_pipeline,
+                    tokenizer_gpu, model_gpu, mapping_gpu,
+                    csv_rows,
+                    article_ids_filtres=article_ids_filtres,
+                    compteur_ignores=compteur_ignores
+                )
                 total_maj += nb
                 print(f"         → {nb} articles mis à jour\n")
 
     conn.close()
     print(f"Terminé. {total_maj} lignes mises à jour (date_estim={TODAY}).")
+    if compteur_ignores["texte_vide"] > 0:
+        print(f"Articles ignorés (texte vide) : {compteur_ignores['texte_vide']}")
 
     if csv_rows:
-        suffix = f"_{company_id_filtre}" if company_id_filtre else "_all"
-        csv_path = os.path.join(os.path.dirname(__file__), f"comparaison_sentiment{suffix}_{TODAY}.csv")
+        if subset_dict is not None:
+            # Mode subset : nommer le CSV différemment pour éviter la confusion
+            suffix = "_subset_v7"
+        else:
+            suffix = f"_{company_id_filtre}" if company_id_filtre else "_all"
+        csv_path = os.path.join(os.path.dirname(__file__), f"output/comparaison_sentiment{suffix}_{TODAY}.csv")
         fieldnames = [
             "article_id", "company_id", "company_name", "type", "titre",
             "note_tfidf", "note_targeted", "note_full",
