@@ -1,3 +1,8 @@
+#C:\Users\DESPLANCHES\Documents\CODES\WINDEV\fluxrss\post blog
+#mon_env\Scripts\activate
+#python -m pip install scikit-learn
+#python benchmark_classification.py
+
 import os
 import re
 
@@ -58,7 +63,7 @@ def filtrer_par_version(df, nom_fichier):
         print("ATTENTION : aucune version détectée dans le nom du fichier.")
         print("  L'analyse va porter sur TOUTES les versions de prompt présentes,")
         print("  donc mélanger des notes non comparables. Nommez le fichier")
-        print("  '_V4.csv' pour filtrer sur la v4.")
+        print("  'benchmark_classification_V4.csv' pour filtrer sur la v4.")
         return df
 
     cible = f"v{correspondance.group(1)}"
@@ -279,7 +284,7 @@ def analyser_zones_reference(df):
     print(
         "  Note : un score 'vs baseline' élevé peut refléter une proximité de style\n"
         "  avec la baseline plutôt qu'une meilleure justesse. Seule une annotation\n"
-        "  REMOVEDelle de la zone grise permet de trancher (cf. export CSV ci-dessous)."
+        "  manuelle de la zone grise permet de trancher (cf. export CSV ci-dessous)."
     )
     return zone_grise
 
@@ -358,9 +363,9 @@ def analyser_par_entreprise(df, seuil_mini=15, top_n=10):
     print("  problème d'alias/de détection d'entité qu'une faiblesse du modèle.")
 
 
-def exporter_zone_grise(zone_grise, chemin="output/zone_grise_a_annoter.csv", taille=100):
+def exporter_zone_grise(zone_grise, chemin="zone_grise_a_annoter.csv", taille=100):
     """
-    Exporte un échantillon stratifié de la zone grise pour annotation REMOVEDelle.
+    Exporte un échantillon stratifié de la zone grise pour annotation manuelle.
     C'est la seule façon de transformer ce benchmark d'un simple "accord
     inter-modèles" en une véritable mesure de justesse.
     """
@@ -746,7 +751,7 @@ def generer_html_rapport(acc_scores, distrib):
         </div>
 
         <footer>
-            <p>Rapport généré automatiquement par .py</p>
+            <p>Rapport généré automatiquement par benchmark_classification.py</p>
             <p style="margin-top: 10px; font-size: 0.9em; color: #999;">
                 📁 Fichiers sources: taux_accord_modeles.png, distribution_biais.png
             </p>
@@ -765,15 +770,33 @@ def generer_html_rapport(acc_scores, distrib):
 # ==========================================
 # POINT D'ENTRÉE
 # ==========================================
-def analyser_benchmark_llm(csv_path="output/benchmark_classification_V2.csv"):
-    if not os.path.exists(csv_path):
-        print(f"Fichier {csv_path} introuvable.")
-        return
+def analyser_benchmark_llm(csv_path="benchmark_classification_V2.csv", df=None, nom_fichier=None):
+    """
+    Analyse les résultats d'un benchmark LLM.
 
-    print(csv_path)
-    df = pd.read_csv(csv_path)
+    Args:
+        csv_path: chemin du CSV à charger (utilisé si df est None)
+        df: DataFrame pré-chargé (optionnel, prioritaire sur csv_path)
+        nom_fichier: nom du fichier pour la détection de version (utilisé si df est fourni)
 
-    df = filtrer_par_version(df, os.path.basename(csv_path))
+    Si df est fourni (import externe), csv_path est ignoré et nom_fichier doit être
+    un chemin/nom contenant la version de prompt (ex. "benchmark_classification_V7.csv").
+    """
+    if df is None:
+        if not os.path.exists(csv_path):
+            print(f"Fichier {csv_path} introuvable.")
+            return
+
+        print(csv_path)
+        df = pd.read_csv(csv_path)
+        nom_fichier = os.path.basename(csv_path)
+    else:
+        # df est pré-chargé : utiliser le nom_fichier fourni, sinon générer un par défaut
+        if nom_fichier is None:
+            nom_fichier = "benchmark_classification.csv"
+        print(f"[benchmark] DataFrame pré-chargé : {nom_fichier}")
+
+    df = filtrer_par_version(df, nom_fichier)
     if df.empty:
         print("Le DataFrame est vide après le filtrage. Vérifiez vos données.")
         return
