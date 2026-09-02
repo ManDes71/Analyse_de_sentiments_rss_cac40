@@ -1,18 +1,19 @@
-# Analyse de sentiment du CAC 40 par LLM
+# Analyse de sentiment CAC 40 par LLM
 
 Pipeline d'evaluation du sentiment financier d'articles RSS par cinq modeles de
 langage (deux API distantes, trois modeles locaux), avec comparaison de leurs
 performances.
 
-> Identifiants de connexion et notes d'environnement : voir `NOTES-LOCALES.md`
-> (non versionne, present uniquement sur la machine de developpement).
+
 
 ## 📊 STRUCTURE GÉNÉRALE
+
+### Pipeline LLM (production)
 
 ```
 evaluate_article.py (orchestrateur : CLI, BDD, CSV, modes sync/batch)
     ├─ llm_common.py (module partagé)
-    │  ├─ PROMPTS (v1 a v4, communs a tous les modeles)
+    │  ├─ PROMPTS (v1 a v7, communs a tous les modeles)
     │  ├─ Validation (pydantic BaseModel)
     │  ├─ Retry/Backoff
     │  └─ Construction custom_id pour batchs
@@ -22,6 +23,18 @@ evaluate_article.py (orchestrateur : CLI, BDD, CSV, modes sync/batch)
        ├─ ollama.py (Lama, Mistral, Queen locaux)
        ├─ gemini.py (Google Gemini API distante)
        └─ haiku.py (Claude Haiku API distante)
+```
+
+### Benchmark et comparaison
+
+```
+benchmark_classification.py (comparaison LLMs vs baseline Gemini+Haiku)
+    └─ Métriques : accuracy, kappa, zone de consensus, biais
+    
+benchmark_classification_tfidf.py (NEW : comparaison TF-IDF vs LLMs)
+    ├─ classifier.py (évaluation TF-IDF + sentiment finance pré-entraîné)
+    ├─ Résultats : accuracy, kappa, couverture, biais, erreurs polaires
+    └─ Rapport HTML : output/benchmark_rapport_tfidf_vs_llm.html
 ```
 
 ---
@@ -93,12 +106,77 @@ evaluate_article.py (orchestre)
 
 1. **nbocc > 1 obligatoire** : l'entreprise doit etre citee plus d'une fois, pour ecarter les faux positifs de jointure (mention en passant dans une revue de marche)
 2. **Aucune limite par entreprise** : tout le corpus est traite (`LIMITE_PAR_ENTREPRISE` pour restreindre en phase de test)
-3. **Quatre versions de prompts** : v1 basique -> v4 (regles brokers + grille complete)
+3. **Sept versions de prompts** : v1 basique -> v7 (extraction structurée + règles affinées)
 4. **Deux modes** : SYNC (immédiat) vs BATCH (-50% coût, +24h délai)
 5. **Validation stricte** : pydantic vérifie note ∈ {0,1,2}
 6. **Retry/Backoff** : gère automatiquement les erreurs API (429, 5xx)
 7. **Logging complet** : chaque article tracé pour diagnostiquer
 8. **Runs reprenables** : un run interrompu se relance sans retraiter (ni refacturer) ce qui est deja fait — voir `REPRENDRE`
+
+---
+
+## 🆕 Benchmark TF-IDF vs LLMs (classifier.py)
+
+### Qu'est-ce que c'est ?
+
+Alternative à base de **TF-IDF + modèle sentiment pré-entraîné** (HuggingFace `bardsai/finance-sentiment-fr-base`) 
+pour comparer la performance vs LLMs (Ollama + Gemini + Haiku).
+
+**Résultat** : Les LLMs surpassent clairement TF-IDF (72.5% Qwen vs 52.6% TF-IDF texte complet).
+
+### Mode d'emploi
+
+#### Option 1 : Run complet (toutes entreprises, nbocc > 2)
+
+```bash
+python3 classifier.py
+```
+
+Produit : `output/comparaison_sentiment_all_{date}.csv`
+
+#### Option 2 : Une seule entreprise (test rapide)
+
+```bash
+python3 classifier.py 15    # TotalEnergies uniquement
+```
+
+Produit : `output/comparaison_sentiment_15_{date}.csv`
+
+#### Option 3 : Restreindre au périmètre d'un benchmark LLM (NEW)
+
+```bash
+# Évaluer UNIQUEMENT les articles du benchmark V7 (1751 lignes)
+python3 classifier.py --subset-csv output/benchmark_classification_V7.csv
+
+# Ou une seule entreprise du subset
+python3 classifier.py --subset-csv output/benchmark_classification_V7.csv 15
+```
+
+Produit : `output/comparaison_sentiment_subset_v7_{date}.csv`
+
+**Pourquoi le mode `--subset-csv` ?**
+- Compare TF-IDF vs LLMs sur **exactement le même ensemble d'articles**
+- Évite les biais d'échantillon
+- Pas de filtre `nbocc` (le nbocc change au fil du temps)
+
+### Comparer les résultats TF-IDF vs LLMs
+
+```bash
+# Après avoir lancé classifier.py avec --subset-csv
+python3 benchmark_classification_tfidf.py
+```
+
+**Sorties** :
+- `output/benchmark_comparatif_tfidf_vs_llm.csv` — Tableau récapitulatif
+- `output/benchmark_rapport_tfidf_vs_llm.html` — Rapport HTML interactif
+
+**Métriques** :
+- Accuracy (% correct vs Gemini baseline)
+- Kappa (accord ajusté du hasard)
+- Accuracy en zone de consensus (Gemini = Haiku, supposée fiable)
+- Couverture (% de lignes avec note valide)
+- Biais net (sur/sous-notation systématique)
+- Erreurs polaires (% d'inversions complètes)
 
 ---
 
@@ -108,15 +186,40 @@ evaluate_article.py (orchestre)
 |-----------|------|
 | `evaluate_article.py` | Orchestre : CLI, acces BDD, export CSV, modes sync et batch, reprise |
 | `llm_common.py` | Prompts versionnes, validation pydantic, retry/backoff, custom_id |
+| `classifier.py` | TF-IDF + modèle sentiment finance pré-entraîné (alternative aux LLMs) |
 | `providers/base.py` | Interfaces abstraites `LLMProvider` et `BatchLLMProvider` |
 | `providers/ollama.py` | Modeles locaux gratuits (sync uniquement) |
 | `providers/gemini.py` | Google Gemini (sync + batch a -50%) |
 | `providers/haiku.py` | Claude Haiku (sync + batch a -50%) |
 
 ---
+
+## 📋 TABLEAU RÉCAPITULATIF — Notes dans classifier.py
+
+`classifier.py` produit **plusieurs types de notes** selon la stratégie d'analyse TF-IDF choisie :
+
+| Colonne | Type | Description |
+|---------|------|-------------|
+| `note_tfidf` | TF-IDF simple | Score brut TF-IDF sur le vocabulaire financier, normalisé [0, 2] (négatif, neutre, positif) |
+| `note_targeted` | TF-IDF + targeted | TF-IDF appliqué uniquement aux **phrases pertinentes** (contenant l'entreprise) |
+| `note_full` | TF-IDF + full | Modèle sentiment pré-entraîné HF (`bardsai/finance-sentiment-fr-base`) sur **texte complet** |
+| `note_gpu` | GPU simple | Variante GPU de `note_tfidf` (si GPU disponible, sinon `None`) |
+| `note_targeted_gpu` | GPU + targeted | Variante GPU de `note_targeted` (si GPU disponible, sinon `None`) |
+| `note_full_gpu` | GPU + full | Variante GPU de `note_full` (si GPU disponible, sinon `None`) |
+
+**Interprétation des résultats** :
+- Colonne **`note_full`** : score du modèle sentiment complet (meilleur compromis qualité/performance)
+- Colonne **`note_targeted`** : score limité aux phrases mentionnant l'entreprise (plus "bruyant" si peu de phrases pertinentes)
+- Colonne **`note_tfidf`** : baseline TF-IDF brut (rapide, moins fiable que targeted/full)
+- Colonnes **`*_gpu`** : versions optimisées si GPU disponible — généralement plus rapides
+
+**Remarque** : Les colonnes GPU sont `None` si aucun GPU n'est détecté au lancement (`torch.cuda.is_available() == False`).
+
+---
+
 #### Exemple :
 ```bash
-REMOVED@DESKTOP-FULACPK:~/projets/classification_textes$ python3 evaluate_article.py
+manu@DESKTOP-FULACPK:~/projets/classification_textes$ python3 evaluate_article.py
 
 Modèles disponibles :
   gemini  -> Google Gemini 2.5 Flash (API distante)
@@ -413,7 +516,7 @@ python3 build_alias_db.py
 
 - 💰 Payant (utilise API Gemini)
 - ✅ Automatise la détection d'aliases
-- ✅ Supprime le besoin de saisie REMOVEDelle
+- ✅ Supprime le besoin de saisie manuelle
 - ⚠️ Qualité dépend du sample d'articles fournis (10 articles)
 - ✅ Schema Pydantic garantit format JSON correct
 
@@ -750,9 +853,9 @@ Fichier `.env` à la racine :
 ```
 DB_HOST=localhost
 DB_PORT=5432
-DB_USER=REMOVED
+DB_USER=...
 DB_PASSWORD=...
-DB_NAME=REMOVED
+DB_NAME=...
 
 GOOGLE_API_KEY=...        # pour gemini
 ANTHROPIC_API_KEY=...     # pour haiku
@@ -795,12 +898,15 @@ BATCH_TAILLE_MAX=500 PROMPT_VERSION=v4 python evaluate_article.py
 
 ### Versions de prompt
 
-| Version | Contenu |
-| --- | --- |
-| `v1` | Règles courtes, NEUTRAL par défaut en cas de doute |
-| `v2` | Isolation des phrases pertinentes, few-shot, règle anti-repli-neutre |
-| `v3` | v2 + règles sur les objectifs de cours et recommandations de brokers |
-| `v4` | v3 corrigé : étape de lecture factuelle explicite + grille complète 3×4 |
+| Version | Contenu | Notes |
+| --- | --- | --- |
+| `v1` | Règles courtes, NEUTRAL par défaut en cas de doute | ⚠️ Baseline simple, biais NEUTRAL |
+| `v2` | Isolation des phrases pertinentes, few-shot, règle anti-repli-neutre | ✅ Amélioration : anti-biais NEUTRAL |
+| `v3` | v2 + règles sur les objectifs de cours et recommandations de brokers | ✅ Finance-spécifique |
+| `v4` | v3 corrigé : étape de lecture factuelle explicite + grille complète 3×4 | ✅ Grille structurée, meilleure accuracy |
+| `v5` | v4 + extraction structurée JSON (validation stricte) | 🆕 JSON-first, moins d'erreurs parsing |
+| `v6` | v5 + contexte boursier + règles sectorales | 🆕 Affiné par secteur (énergie, tech, etc.) |
+| `v7` | v6 + zero-shot vs few-shot variante | 🆕 Benchmark pour comparer approches |
 
 **Règle absolue : ne jamais modifier un prompt existant en place.** Toute évolution
 crée une nouvelle version. Le mécanisme de reprise compare la version stockée en base
