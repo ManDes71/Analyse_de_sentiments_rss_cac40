@@ -9,6 +9,10 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
+from entreprises import charger_alias, compter_citations, variantes_entreprise
+from historique_notes import enregistrer as historiser
+from perimetre import raison_exclusion
+
 ##{nom llm;nom modele;type d'API;nom fichier CSV;colonne tableau de résultats}
 #{gemini;gemini-2.5-flash;API Distante;output/resultats_gemini_{date_jour}.csv; note_gemini}
 #{haiku;claude-haiku-4-5;API Distante;output/resultats_haiku_{date_jour}.csv; note_haiku}
@@ -124,6 +128,10 @@ COLONNE_NOTE = {
     "queen":   "note_queen",
 }
 
+# Table inverse : le chemin des batchs ne reçoit que les noms de colonnes, pas
+# le modèle, dont l'historisation a besoin.
+MODELE_PAR_COLONNE_NOTE = {colonne: modele for modele, colonne in COLONNE_NOTE.items()}
+
 COLONNE_JUSTIF = {
     "gemini":  "justification_gemini",
     "haiku":   "justification_haiku",
@@ -173,24 +181,14 @@ COLONNE_EXTRACTION = {
 
 
 # ==========================================
-# GESTION DES ALIAS ET REGEX (FILTRAGE)
+# PÉRIMÈTRE D'ÉVALUATION
 # ==========================================
-def charger_dictionnaire_alias(chemin_fichier="output/alias.json"):
-    if not os.path.exists(chemin_fichier):
-        print(f"Attention : le fichier {chemin_fichier} est introuvable. On continue sans alias.")
-        return {}
-    with open(chemin_fichier, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def compiler_regex_entreprise(nom_entreprise, liste_alias):
-    cibles = [nom_entreprise.lower()] + [a.lower() for a in liste_alias]
-    cibles_echappees = [re.escape(cible) for cible in set(cibles) if cible]
-    motif = r'\b(' + '|'.join(cibles_echappees) + r')\b'
-    return re.compile(motif, re.IGNORECASE)
-
-def compter_occurrences(texte, regex_compilee):
-    if not texte: return 0
-    return len(regex_compilee.findall(texte))
+# Un couple (article, entreprise) n'est soumis au LLM que s'il passe
+# perimetre.raison_exclusion() : genre, titre de chronique ou de liste, corps
+# présent, nom de l'entreprise dans le titre. Remplace l'ancien recomptage
+# « plus d'une occurrence dans le contenu », qui divergeait du nbocc > 2 de
+# classifier.py sur 722 couples sur 3092 : les deux scripts partagent
+# désormais la même règle.
 
 # ==========================================
 # ACCÈS AUX ARTICLES (partagé entre mode sync et mode batch)
@@ -214,11 +212,14 @@ CLAUSE_LIMITE = f"LIMIT {int(_LIMITE)}" if _LIMITE.isdigit() else ""
 QUERY_ARTICLES = f"""
     SELECT
         a.id,
+        a.titre,
         a.contenu,
+        g.label AS genre,
         LENGTH(a.contenu) AS longueur_caracteres,
         array_length(regexp_split_to_array(trim(a.contenu), '\\s+'), 1) AS longueur_mots
     FROM public.articles_rss a
     JOIN public.article_companies ac ON ac.article_id = a.id
+    LEFT JOIN public.article_genres g ON g.article_id = a.id AND g.actif
     WHERE ac.company_id = %s
     AND a.contenu IS NOT NULL
     ORDER BY a.id DESC
@@ -229,7 +230,7 @@ QUERY_ARTICLES = f"""
 # avec succès PAR CE MODÈLE et POUR CETTE VERSION DE PROMPT.
 #
 # Sans ce filtre, relancer après une interruption (quota batch atteint, coupure
-# réseau, arrêt REMOVEDel) resoumet tout depuis le début — donc repaie les articles
+# réseau, arrêt manuel) resoumet tout depuis le début — donc repaie les articles
 # déjà traités et sature à nouveau le quota.
 #
 # Les lignes en statut 'failed' sont volontairement RECONSERVÉES : un échec doit
@@ -249,11 +250,14 @@ QUERY_ARTICLES = f"""
 QUERY_ARTICLES_REPRENABLE = f"""
     SELECT
         a.id,
+        a.titre,
         a.contenu,
+        g.label AS genre,
         LENGTH(a.contenu) AS longueur_caracteres,
         array_length(regexp_split_to_array(trim(a.contenu), '\\s+'), 1) AS longueur_mots
     FROM public.articles_rss a
     JOIN public.article_companies ac ON ac.article_id = a.id
+    LEFT JOIN public.article_genres g ON g.article_id = a.id AND g.actif
     WHERE ac.company_id = %s
     AND a.contenu IS NOT NULL
     AND (
@@ -349,7 +353,7 @@ def choisir_version_prompt():
     Sélectionne la version de prompt à utiliser (A/B testing).
     Priorité à la variable d'environnement PROMPT_VERSION pour permettre de
     lancer des runs scriptés (ex: deux appels successifs du script, un par
-    version, sans interaction REMOVEDelle) :
+    version, sans interaction manuelle) :
         PROMPT_VERSION=v2 python evaluate_article.py
     """
     depuis_env = os.getenv("PROMPT_VERSION")
@@ -365,9 +369,10 @@ def choisir_version_prompt():
     print("  v2 -> Prompt enrichi (isolation des phrases pertinentes, few-shot, anti-repli-neutre)")
     print("  v3 -> v2 + règles dédiées objectifs de cours / recommandations de brokers")
     print("  v4 -> v3 corrigé (lecture factuelle explicite + grille complète 3x4)")
-    print("  v5 -> v2 + règles issues de l'annotation REMOVEDelle (intraday, palmarès, matérialité)")
+    print("  v5 -> v2 + règles issues de l'annotation manuelle (intraday, palmarès, matérialité)")
     print("  v6 -> v2 + extraction structurée : le LLM constate, le code décide")
     print("  v7 -> v6 avec autre_fait_concret corrigé (la variation de cours n'est plus un fait)")
+    print("  v8 -> v7 + entreprise visée / entreprise source / matérialité (191 annotations humaines)")
     while True:
         choix = input(f"\nChoisissez la version de prompt [{'/'.join(PROMPTS)}] : ").strip().lower()
         if choix in PROMPTS:
@@ -422,7 +427,7 @@ def main():
         help=(
             "Ne fait que vérifier/récupérer les résultats d'un batch déjà soumis "
             "(fichier output/batches_*.json généré par un run en mode batch). "
-            "Ne bloque pas : à relancer plus tard (REMOVEDellement ou via cron) tant "
+            "Ne bloque pas : à relancer plus tard (manuellement ou via cron) tant "
             "que des batchs sont encore en cours."
         ),
     )
@@ -455,8 +460,8 @@ def main_sync(modele, version_prompt):
     )
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # Charger les alias
-    dict_alias = charger_dictionnaire_alias("output/alias.json")
+    # Alias chargés avant tout filtrage : variantes_entreprise() les lit.
+    charger_alias(cur)
 
     # Récupérer les entreprises
     cur.execute("SELECT id, name FROM public.companies ORDER BY id")
@@ -501,8 +506,7 @@ def main_sync(modele, version_prompt):
             company_name = company['name']
 
             # Préparer le filtre pour cette entreprise
-            alias_liste = dict_alias.get(company_name, [])
-            regex_entreprise = compiler_regex_entreprise(company_name, alias_liste)
+            motif_entreprise = variantes_entreprise(company_id, company_name)
 
             print(f"\n--- Traitement de [{company_id}] {company_name} ---")
             fichier_log.write(f"\n>>> ENTREPRISE: {company_name} (ID={company_id})\n")
@@ -517,11 +521,13 @@ def main_sync(modele, version_prompt):
                 longueur_caracteres = article['longueur_caracteres']
                 longueur_mots = article['longueur_mots']
 
-                # 1. Filtrage par occurrence (> 1)
-                nb_occ = compter_occurrences(texte, regex_entreprise)
+                # 1. Périmètre (genre, titre, corps). nb_occ n'est plus qu'une
+                #    information de log.
+                raison = raison_exclusion(article['genre'], article['titre'], texte, motif_entreprise)
+                nb_occ = compter_citations(motif_entreprise, texte)
 
-                if nb_occ > 1:
-                    print(f"Article {article_id} retenu ({nb_occ} occurrences). Évaluation LLM en cours...")
+                if not raison:
+                    print(f"Article {article_id} retenu. Évaluation LLM en cours...")
                     log_article(article_id, company_name, nb_occ, "Sélectionné pour évaluation", "", "")
 
                     # 2. Évaluation LLM
@@ -551,10 +557,10 @@ def main_sync(modele, version_prompt):
                         log_article(article_id, company_name, nb_occ, "Évaluation réussie", f"Note={note}", "ok")
 
                         # 3. Sauvegarder en BDD : note, justification, statut, version de
-                        # prompt ET faits extraits (v6). Attention : le run le plus récent
-                        # écrase le précédent en base (colonnes non-cumulatives). Pour
-                        # comparer deux versions sans perte, se référer aux fichiers CSV
-                        # horodatés, qui gardent l'historique complet de chaque run.
+                        # prompt ET faits extraits (v6). Le run le plus récent écrase le
+                        # précédent dans article_companies (une seule colonne de note par
+                        # modèle) : c'est la note COURANTE. L'historique par version vit
+                        # dans article_company_notes, alimenté par historiser() juste après.
                         #
                         # note_finale() applique les règles déterministes aux faits
                         # extraits : la note stockée peut donc différer de celle du
@@ -569,6 +575,8 @@ def main_sync(modele, version_prompt):
                         '''
                         cur.execute(update_query, (note, justif, statut, version_prompt,
                                                    extraction, article_id, company_id))
+                        historiser(cur, modele, version_prompt, article_id, company_id,
+                                   note, justif, statut, extraction)
                         conn.commit()
 
                         writer.writerow({
@@ -607,6 +615,8 @@ def main_sync(modele, version_prompt):
                             WHERE article_id = %s AND company_id = %s
                         '''
                         cur.execute(update_query, (statut, version_prompt, article_id, company_id))
+                        historiser(cur, modele, version_prompt, article_id, company_id,
+                                   None, None, statut, None)
                         conn.commit()
 
                         writer.writerow({
@@ -627,13 +637,7 @@ def main_sync(modele, version_prompt):
                     # API distantes limitees en debit, pause plus longue
                     time.sleep(4 if modele in ("gemini", "haiku") else 1)
                 else:
-                    # L'article mentionne l'entreprise 1 fois ou 0 fois (faux positif de jointure)
-                    if nb_occ == 1:
-                        log_article(article_id, company_name, nb_occ, "Filtré: nbocc=1", "SKIPPED", "not_evaluated")
-                    elif nb_occ == 0:
-                        log_article(article_id, company_name, nb_occ, "Filtré: nbocc=0 (faux positif)", "SKIPPED", "not_evaluated")
-                    else:
-                        log_article(article_id, company_name, nb_occ, f"Filtré: nbocc={nb_occ}", "SKIPPED", "not_evaluated")
+                    log_article(article_id, company_name, nb_occ, f"Exclu : {raison}", "SKIPPED", "not_evaluated")
 
         # Fermer le fichier de log avec un résumé final
         fichier_log.write("\n" + "="*120 + "\n")
@@ -686,7 +690,7 @@ def _sauver_meta_batch(chemin, modele, version_prompt, batches_meta, requetes_pa
 def soumettre_batch_run(modele, version_prompt):
     """
     Phase 1+2 seulement : collecte des articles éligibles (mêmes règles qu'en
-    mode sync, nb_occ > 1) puis soumission en batch(s) de BATCH_TAILLE_MAX
+    mode sync : perimetre.raison_exclusion()) puis soumission en batch(s) de BATCH_TAILLE_MAX
     requêtes. Retour immédiat (pas d'attente des résultats) : les métadonnées
     (batch_id + requêtes + emplacement des fichiers de sortie) sont écrites
     dans output/batches_{modele}_{version}_{date}.json.
@@ -711,7 +715,7 @@ def soumettre_batch_run(modele, version_prompt):
     )
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    dict_alias = charger_dictionnaire_alias("output/alias.json")
+    charger_alias(cur)
     cur.execute("SELECT id, name FROM public.companies ORDER BY id")
     companies = cur.fetchall()
 
@@ -741,17 +745,17 @@ def soumettre_batch_run(modele, version_prompt):
         for company in companies:
             company_id = company['id']
             company_name = company['name']
-            alias_liste = dict_alias.get(company_name, [])
-            regex_entreprise = compiler_regex_entreprise(company_name, alias_liste)
+            motif_entreprise = variantes_entreprise(company_id, company_name)
 
             articles = recuperer_articles_entreprise(cur, company_id, modele, version_prompt)
 
             for article in articles:
                 texte = article['contenu']
                 article_id = article['id']
-                nb_occ = compter_occurrences(texte, regex_entreprise)
+                raison = raison_exclusion(article['genre'], article['titre'], texte, motif_entreprise)
+                nb_occ = compter_citations(motif_entreprise, texte)
 
-                if nb_occ > 1:
+                if not raison:
                     requetes.append({
                         "custom_id": construire_custom_id(article_id, company_id),
                         "article_id": article_id,
@@ -764,7 +768,7 @@ def soumettre_batch_run(modele, version_prompt):
                     log_article(article_id, company_name, nb_occ, "Sélectionné pour le batch", "", "")
                 else:
                     total_filtres += 1
-                    log_article(article_id, company_name, nb_occ, f"Filtré: nbocc={nb_occ}", "SKIPPED", "not_evaluated")
+                    log_article(article_id, company_name, nb_occ, f"Exclu : {raison}", "SKIPPED", "not_evaluated")
 
         print(f"Collecte terminée : {len(requetes)} article(s) à évaluer, {total_filtres} filtré(s).")
 
@@ -905,6 +909,8 @@ def _ecrire_resultat_batch(cur, writer, log_article, req, resultat, statut, vers
             ''',
             (note, justif, statut, version_prompt, extraction, article_id, company_id),
         )
+        historiser(cur, MODELE_PAR_COLONNE_NOTE[colonne_note], version_prompt,
+                   article_id, company_id, note, justif, statut, extraction)
         writer.writerow({
             'article_id': article_id,
             'entreprise': company_name,
@@ -930,6 +936,8 @@ def _ecrire_resultat_batch(cur, writer, log_article, req, resultat, statut, vers
         ''',
         (statut, version_prompt, article_id, company_id),
     )
+    historiser(cur, MODELE_PAR_COLONNE_NOTE[colonne_note], version_prompt,
+               article_id, company_id, None, None, statut, None)
     writer.writerow({
         'article_id': article_id,
         'entreprise': company_name,
@@ -950,7 +958,7 @@ def recuperer_batch_run(chemin_meta):
     soumettre_batch_run()) et écrit les résultats de ceux qui sont terminés.
 
     Ne bloque JAMAIS : une seule vérification par batch, puis retour. À
-    relancer plus tard (REMOVEDellement ou via une tâche planifiée) tant qu'il
+    relancer plus tard (manuellement ou via une tâche planifiée) tant qu'il
     reste des batchs en cours — c'est ce découpage qui permet d'éteindre la
     machine entre la soumission et la récupération, le batch tournant
     entièrement côté fournisseur.
