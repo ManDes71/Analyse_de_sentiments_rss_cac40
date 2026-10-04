@@ -1,997 +1,173 @@
 # Analyse de sentiment CAC 40 par LLM
 
-Pipeline d'evaluation du sentiment financier d'articles RSS par cinq modeles de
-langage (deux API distantes, trois modeles locaux), avec comparaison de leurs
-performances.
+**Une note de sentiment fiable, entreprise par entreprise, pour les articles de presse financière — construite en mesurant ce que valent les modèles plutôt qu'en leur faisant confiance.**
 
+![Python](https://img.shields.io/badge/python-3.13%2B-blue)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-336791)
+![Statut](https://img.shields.io/badge/statut-en%20cours-orange)
 
-
-## 📊 STRUCTURE GÉNÉRALE
-
-### Pipeline LLM (production)
-
-```
-evaluate_article.py (orchestrateur : CLI, BDD, CSV, modes sync/batch)
-    ├─ llm_common.py (module partagé)
-    │  ├─ PROMPTS (v1 a v7, communs a tous les modeles)
-    │  ├─ Validation (pydantic BaseModel)
-    │  ├─ Retry/Backoff
-    │  └─ Construction custom_id pour batchs
-    │
-    └─ providers/ (abstraction des LLM)
-       ├─ base.py (classe abstraite Provider)
-       ├─ ollama.py (Lama, Mistral, Queen locaux)
-       ├─ gemini.py (Google Gemini API distante)
-       └─ haiku.py (Claude Haiku API distante)
-```
-
-### Benchmark et comparaison
-
-```
-benchmark_classification.py (comparaison LLMs vs baseline Gemini+Haiku)
-    └─ Métriques : accuracy, kappa, zone de consensus, biais
-    
-benchmark_classification_tfidf.py (NEW : comparaison TF-IDF vs LLMs)
-    ├─ classifier.py (évaluation TF-IDF + sentiment finance pré-entraîné)
-    ├─ Résultats : accuracy, kappa, couverture, biais, erreurs polaires
-    └─ Rapport HTML : output/benchmark_rapport_tfidf_vs_llm.html
-```
+> Série d'articles associée : *Market-RSS-Sentiment* sur [aventuresdata.com](https://aventuresdata.com). Ce dépôt documente le code ; le blog raconte la démarche.
 
 ---
 
+## Contexte
 
-## 🔄 FLUX D'EXÉCUTION
+Noter le sentiment d'un article sur une entreprise précise paraît simple, jusqu'à ce qu'on essaie de le mesurer. Un article sur la séance du CAC 40 cite dix valeurs et ne dit rien de chacune d'elles ; un modèle de langage lui attribue pourtant une note. Deux modèles cloud de premier plan ne s'accordent que dans 80 % des cas, et aucun n'est « la vérité ».
 
-### Mode SYNC (temps réel)
+Ce projet répond à une question de produit avant d'être une question de modèle : **comment obtenir une note de référence dont on connaît la fiabilité, au meilleur coût ?** Il part de flux RSS, décide quels couples (article, entreprise) méritent d'être notés, les fait noter par plusieurs LLM, et mesure le résultat contre 191 annotations humaines.
 
-```
-evaluate_article.py
-    ├─ Récupère articles (filtre de reprise applique par defaut)
-    ├─ Pour chaque article :
-    │  ├─ Filtre nbocc > 1
-    │  ├─ Appelle provider.evaluer_un()
-    │  │  ├─ Construit prompt (llm_common.PROMPTS)
-    │  │  ├─ Appelle LLM (ollama / gemini / haiku)
-    │  │  ├─ Valide réponse (llm_common.EvaluationSentiment)
-    │  │  └─ Retourne (note, statut)
-    │  ├─ Sauvegarde en BDD (UPDATE article_companies)
-    │  ├─ Écrit en CSV
-    │  └─ Log article
-    └─ Terminé immédiatement
-```
+## Ce que fait le projet
 
-### Mode BATCH (différé, -50% coût)
+- **Délimite le périmètre par genre d'article**, pas par comptage d'occurrences : embeddings multilingues, clustering, puis règles ordonnées (`perimetre.py`). Un article de chronique de marché sort ; un article dédié à l'entreprise entre.
+- **Fait noter chaque couple par cinq modèles** — Gemini 2.5 Flash et Claude Haiku (API distantes), Llama 3.1 8B, Mistral Nemo et Qwen 2.5 7B (locaux via Ollama) — avec des prompts versionnés et une sortie validée par Pydantic.
+- **Exécute en mode synchrone ou batch** (−50 % de coût, jusqu'à 24 h de délai), avec reprise automatique des runs interrompus pour ne jamais refacturer ce qui est déjà fait.
+- **Historise toutes les notes** par (couple, modèle, version de prompt) pour comparer deux versions d'un prompt par une simple requête SQL.
+- **Calcule une note de consensus** : médiane de trois modèles, avec un indicateur d'unanimité qui dit, couple par couple, s'il faut s'y fier.
+- **Mesure tout contre une vérité humaine** : 191 couples annotés à la main avec un outil HTML maison, jamais utilisés pour l'entraînement.
+- **Prépare et teste l'entraînement d'un transformer** (CamemBERT) à partir des étiquettes du consensus. Résultat à ce jour : un échec instructif, documenté plus bas.
+
+## Architecture et stack
 
 ```
-evaluate_article.py
-    ├─ Récupère articles (filtre de reprise applique par defaut)
-    ├─ Appelle provider.soumettre_batch()
-    │  ├─ Construit les requetes JSON (BATCH_TAILLE_MAX par lot)
-    │  ├─ Soumet batch à API (Gemini / Haiku)
-    │  └─ Reçoit batch_id
-    ├─ Sauvegarde métadonnées (batches_XXX.json)
-    └─ Terminé (batch tourne côté serveur)
-
-PLUS TARD :
-evaluate_article.py --collect batches_XXX.json
-    ├─ Récupère batch_id
-    ├─ Appelle provider.recuperer_resultats()
-    ├─ Récupère résultats (une fois SUCCEEDED)
-    ├─ Sauvegarde en BDD
-    └─ Écrit en CSV
+flux RSS (collecte et rattachement par entreprise : projet voisin fluxRss)
+        │
+        ▼
+PostgreSQL  (articles, entreprises + alias, couples article/entreprise, notes)
+        │
+        ├─ cluster_genres.py ─► genres d'article (E5 multilingue + HDBSCAN, pgvector)
+        │
+        ├─ perimetre.py ─────► quels couples méritent d'être notés
+        │
+        ▼
+evaluate_article.py ── providers/ (gemini · haiku · ollama) ── llm_common.py (prompts, validation, retry)
+        │
+        ├─ historique_notes.py ─► table article_company_notes (une ligne par couple / modèle / version)
+        │
+        ▼
+note_consensus.py ─► note_consensus + consensus_unanime
+        │
+        ├─ benchmark_classification.py ─► comparaison aux annotations humaines
+        │
+        └─ preparer_corpus.py ─► entrainer_transformer.py (CamemBERT, test sur les 191 annotations)
 ```
 
----
+| Domaine | Choix |
+|---|---|
+| Langage, dépendances | Python 3.13+, gestion par `uv` (`pyproject.toml`, `uv.lock`) |
+| LLM distants | Gemini 2.5 Flash, Claude Haiku 4.5 (appels REST directs, API batch) |
+| LLM locaux | Llama 3.1 8B, Mistral Nemo, Qwen 2.5 7B via Ollama (RTX 3060 12 Go) |
+| Données | PostgreSQL, extension pgvector pour les embeddings de genre |
+| Validation | Pydantic (schéma de sortie, plages de valeurs, énumérations) |
+| ML classique | scikit-learn, pandas, matplotlib, seaborn |
+| Transformers | PyTorch, Hugging Face `transformers`, `camembert-base` |
+| Traitement du texte | NLTK, spaCy (modèle français), `intfloat/multilingual-e5-base` |
 
-## 📋 RÉSUMÉ INTERACTIONS
+## Installation
 
-```
-evaluate_article.py (orchestre)
-        ↓
-    llm_common.py (config partagée)
-        ├─ PROMPTS (v1 a v4)
-        ├─ EvaluationSentiment (validation)
-        ├─ Retry/Backoff
-        └─ Batch construction
-        ↓
-    providers/ (abstraction LLM)
-        ├─ ollama.py (local, gratuit, sync seul)
-        ├─ gemini.py (cloud, sync+batch)
-        └─ haiku.py (cloud, sync+batch)
-```
-
----
-
-## 🎯 POINTS CLÉS
-
-1. **nbocc > 1 obligatoire** : l'entreprise doit etre citee plus d'une fois, pour ecarter les faux positifs de jointure (mention en passant dans une revue de marche)
-2. **Aucune limite par entreprise** : tout le corpus est traite (`LIMITE_PAR_ENTREPRISE` pour restreindre en phase de test)
-3. **Sept versions de prompts** : v1 basique -> v7 (extraction structurée + règles affinées)
-4. **Deux modes** : SYNC (immédiat) vs BATCH (-50% coût, +24h délai)
-5. **Validation stricte** : pydantic vérifie note ∈ {0,1,2}
-6. **Retry/Backoff** : gère automatiquement les erreurs API (429, 5xx)
-7. **Logging complet** : chaque article tracé pour diagnostiquer
-8. **Runs reprenables** : un run interrompu se relance sans retraiter (ni refacturer) ce qui est deja fait — voir `REPRENDRE`
-
----
-
-## 🆕 Benchmark TF-IDF vs LLMs (classifier.py)
-
-### Qu'est-ce que c'est ?
-
-Alternative à base de **TF-IDF + modèle sentiment pré-entraîné** (HuggingFace `bardsai/finance-sentiment-fr-base`) 
-pour comparer la performance vs LLMs (Ollama + Gemini + Haiku).
-
-**Résultat** : Les LLMs surpassent clairement TF-IDF (72.5% Qwen vs 52.6% TF-IDF texte complet).
-
-### Mode d'emploi
-
-#### Option 1 : Run complet (toutes entreprises, nbocc > 2)
+Prérequis : Python 3.13 ou plus, [`uv`](https://docs.astral.sh/uv/), une base PostgreSQL alimentée par le projet de collecte, et pour les modèles locaux un serveur [Ollama](https://ollama.com) avec `llama3.1:8b`, `mistral-nemo` et `qwen2.5:7b`.
 
 ```bash
-python3 classifier.py
-```
-
-Produit : `output/comparaison_sentiment_all_{date}.csv`
-
-#### Option 2 : Une seule entreprise (test rapide)
-
-```bash
-python3 classifier.py 15    # TotalEnergies uniquement
-```
-
-Produit : `output/comparaison_sentiment_15_{date}.csv`
-
-#### Option 3 : Restreindre au périmètre d'un benchmark LLM (NEW)
-
-```bash
-# Évaluer UNIQUEMENT les articles du benchmark V7 (1751 lignes)
-python3 classifier.py --subset-csv output/benchmark_classification_V7.csv
-
-# Ou une seule entreprise du subset
-python3 classifier.py --subset-csv output/benchmark_classification_V7.csv 15
-```
-
-Produit : `output/comparaison_sentiment_subset_v7_{date}.csv`
-
-**Pourquoi le mode `--subset-csv` ?**
-- Compare TF-IDF vs LLMs sur **exactement le même ensemble d'articles**
-- Évite les biais d'échantillon
-- Pas de filtre `nbocc` (le nbocc change au fil du temps)
-
-### Comparer les résultats TF-IDF vs LLMs
-
-```bash
-# Après avoir lancé classifier.py avec --subset-csv
-python3 benchmark_classification_tfidf.py
-```
-
-**Sorties** :
-- `output/benchmark_comparatif_tfidf_vs_llm.csv` — Tableau récapitulatif
-- `output/benchmark_rapport_tfidf_vs_llm.html` — Rapport HTML interactif
-
-**Métriques** :
-- Accuracy (% correct vs Gemini baseline)
-- Kappa (accord ajusté du hasard)
-- Accuracy en zone de consensus (Gemini = Haiku, supposée fiable)
-- Couverture (% de lignes avec note valide)
-- Biais net (sur/sous-notation systématique)
-- Erreurs polaires (% d'inversions complètes)
-
----
-
-## 📊 TABLEAU RÉCAPITULATIF
-
-| Composant | Rôle |
-|-----------|------|
-| `evaluate_article.py` | Orchestre : CLI, acces BDD, export CSV, modes sync et batch, reprise |
-| `llm_common.py` | Prompts versionnes, validation pydantic, retry/backoff, custom_id |
-| `classifier.py` | TF-IDF + modèle sentiment finance pré-entraîné (alternative aux LLMs) |
-| `providers/base.py` | Interfaces abstraites `LLMProvider` et `BatchLLMProvider` |
-| `providers/ollama.py` | Modeles locaux gratuits (sync uniquement) |
-| `providers/gemini.py` | Google Gemini (sync + batch a -50%) |
-| `providers/haiku.py` | Claude Haiku (sync + batch a -50%) |
-
----
-
-## 📋 TABLEAU RÉCAPITULATIF — Notes dans classifier.py
-
-`classifier.py` produit **plusieurs types de notes** selon la stratégie d'analyse TF-IDF choisie :
-
-| Colonne | Type | Description |
-|---------|------|-------------|
-| `note_tfidf` | TF-IDF simple | Score brut TF-IDF sur le vocabulaire financier, normalisé [0, 2] (négatif, neutre, positif) |
-| `note_targeted` | TF-IDF + targeted | TF-IDF appliqué uniquement aux **phrases pertinentes** (contenant l'entreprise) |
-| `note_full` | TF-IDF + full | Modèle sentiment pré-entraîné HF (`bardsai/finance-sentiment-fr-base`) sur **texte complet** |
-| `note_gpu` | GPU simple | Variante GPU de `note_tfidf` (si GPU disponible, sinon `None`) |
-| `note_targeted_gpu` | GPU + targeted | Variante GPU de `note_targeted` (si GPU disponible, sinon `None`) |
-| `note_full_gpu` | GPU + full | Variante GPU de `note_full` (si GPU disponible, sinon `None`) |
-
-**Interprétation des résultats** :
-- Colonne **`note_full`** : score du modèle sentiment complet (meilleur compromis qualité/performance)
-- Colonne **`note_targeted`** : score limité aux phrases mentionnant l'entreprise (plus "bruyant" si peu de phrases pertinentes)
-- Colonne **`note_tfidf`** : baseline TF-IDF brut (rapide, moins fiable que targeted/full)
-- Colonnes **`*_gpu`** : versions optimisées si GPU disponible — généralement plus rapides
-
-**Remarque** : Les colonnes GPU sont `None` si aucun GPU n'est détecté au lancement (`torch.cuda.is_available() == False`).
-
----
-
-#### Exemple :
-```bash
-manu@DESKTOP-FULACPK:~/projets/classification_textes$ python3 evaluate_article.py
-
-Modèles disponibles :
-  gemini  -> Google Gemini 2.5 Flash (API distante)
-  haiku   -> Claude Haiku (API distante Anthropic)
-  lama    -> LLaMA 3 via Ollama (local)
-  mistral -> Mistral Nemo via Ollama (local)
-  queen   -> Qwen 2.5 7B via Ollama (local)
-
-Choisissez le modèle [gemini/haiku/lama/mistral/queen] : gemini
-
-Versions de prompt disponibles :
-  v1 -> Prompt original (règles courtes, NEUTRAL par défaut)
-  v2 -> Prompt enrichi (isolation des phrases pertinentes, few-shot, anti-repli-neutre)
-  v3 -> v2 + règles dédiées objectifs de cours / recommandations de brokers
-
-Choisissez la version de prompt [v1/v2/v3] : v2
-
-Modes disponibles :
-  sync  -> appel immédiat article par article (comme avant)
-  batch -> soumission par lot (-50% de coût, jusqu'à 24h de délai)
-
-Choisissez le mode [sync/batch] : batch
-
-Modèle sélectionné : gemini (mode batch — soumission uniquement)
-Connexion à la BDD...
-
---- Phase 1/2 : collecte des articles éligibles ---
-Collecte terminée : 1281 article(s) à évaluer, 1595 filtré(s).
-
---- Phase 2/2 : soumission des batchs ---
-Soumission du chunk 1/2 (1000 requête(s))...
-  -> batch_id=batches/5t1r7kh780i0m2wxbsixqchmcecxtlbukhx6
-Soumission du chunk 2/2 (281 requête(s))...
-  -> batch_id=batches/a8818d0aic680bag4hrzxiu3r9a99elyg2n2
-
-1281 article(s) soumis dans 2 batch(s).
-Métadonnées : output/batches_gemini_v2_20260813_212410.json
-Le batch continue de tourner côté fournisseur même si cette machine s'éteint. Pour récupérer les résultats (à relancer tant que des batchs sont en cours, ex. via une tâche planifiée) :
-  python evaluate_article.py --collect output/batches_gemini_v2_20260813_212410.json
-```
-
-
-resultats du batch :
-
-```bash
-# important pour commencer
+uv sync                      # crée .venv à partir de pyproject.toml / uv.lock
 source .venv/bin/activate
-# Pour Gemini (listing centralisé des batchs)
-python3 verif__limit_batch.py              # liste les jobs batch Gemini et leur état
-python3 verif__limit_batch.py --annuler    # annule les jobs qui traînent (libère quota)
-
-# Pour Haiku (lecture depuis fichiers JSON locaux)
-python3 verif_batch_haiku.py                          # statut de tous les batchs Haiku
-python3 verif_batch_haiku.py output/batches_haiku_v3_*.json  # fichiers spécifiques
-python3 verif_batch_haiku.py msgbatch_XXXXXXXXXX     # batch_id direct
-
-# Récupérer batchs orphelins
-python3 recuperer_batch_orphelin.py v4 batches/xxxx   # reconstruit les métadonnées d'un batch perdu
+cp .env.example .env         # puis renseigner la base et les clés API
 ```
 
+Les clés et mots de passe ne doivent jamais être versionnés : `.env` est dans `.gitignore`. Variables principales :
 
----
-
-## 7️⃣ PROGRAMMES UTILITAIRES
-
-### ✅ set_company_occurs.py
-
-**Rôle** : Calcule `nbocc` (nombre d'occurrences) pour chaque entreprise dans chaque article
-
-**Importance** : 🔴 **CRITIQUE** - Ce programme doit tourner AVANT `evaluate_article.py`
-
-#### Flux :
-
-```python
-1. Charger alias.json (alias par entreprise)
-2. Pour chaque entreprise :
-   a. Compiler regex avec \b (word boundaries)
-   b. SELECT tous les articles
-   c. Compter occurrences du nom + tous ses alias
-   d. UPDATE article_companies.nbocc
-   e. UPDATE article_companies.date_estim = TODAY
+```
+DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+GOOGLE_API_KEY      # Gemini
+ANTHROPIC_API_KEY   # Haiku
+OLLAMA_URL=http://127.0.0.1:11434/api/generate
 ```
 
-#### Configuration :
+La migration SQL initiale (colonnes `statut_*`, `prompt_version_*`, suppression des `DEFAULT 0` sur les colonnes `note_*`) est décrite en tête de `evaluate_article.py`. Le `DEFAULT 0` est un piège : sans lui, une ligne jamais évaluée naît avec la note 0, c'est-à-dire négative, indiscernable d'un vrai jugement négatif.
 
-```python
-QUERY_ARTICLES = SELECT articles pour une entreprise
-nbocc = nombre total (nom + aliases)
-note_tfidf = 0 (pas touché)
-note_full = 0 (pas touché)
-```
+## Utilisation
 
-#### Usage :
+Le pipeline se lance dans cet ordre.
 
 ```bash
-# Une entreprise (id=15)
-python3 set_company_occurs.py 15
-
-# Toutes les entreprises
-python3 set_company_occurs.py
-```
-
-#### Points clés :
-
-- 🔴 **DOIT tourner avant evaluate_article.py**
-- Filtre articles avec nbocc > 1 au moment de l'évaluation
-
----
-
-### ✅ reload_article_companies_notes.py
-
-**Rôle** : Récharge les notes LLM en BDD à partir de fichiers CSV exportés précédemment
-
-**Use-case** : 
-- Vous aviez sauvegardé un CSV avec des notes, mais elles ne sont plus en BDD
-- Vous voulez ré-importer des résultats depuis des runs antérieurs
-- Récupérer des résultats qui ont été accidentellement supprimés
-
-#### Flux :
-
-```python
-1. Scanner fichiers CSV (avec glob patterns)
-2. Détecter le modèle depuis le nom de fichier
-   → "resultats_mistral_XXX.csv" → "mistral"
-   → "resultats_haiku_XXX.csv" → "haiku"
-3. Pour chaque ligne du CSV :
-   a. Normaliser nom entreprise + article_id
-   b. Chercher en BDD via (article_id, company_id)
-   c. Importer note_llm et justification
-   d. UPDATE article_companies avec ces colonnes
-4. Commit en fin de processus
-```
-
-#### Colonnes mappées :
-
-```python
-MODEL_TO_COLUMNS = {
-    "gemini": ("note_gemini", "justification_gemini"),
-    "haiku": ("note_haiku", "justification_haiku"),
-    "mistral": ("note_mistral", "justification_mistral"),
-    "queen": ("note_queen", "justification_queen"),
-    "lama": ("note_llama3", "justification_lama"),
-}
-```
-
-#### Usage :
-
-```bash
-# Tous les CSV de sortie/
-python3 reload_article_companies_notes.py
-
-# Un CSV spécifique
-python3 reload_article_companies_notes.py output/resultats_mistral_20260803_193015.csv
-
-# Plusieurs CSV (glob)
-python3 reload_article_companies_notes.py output/resultats_mistral_*.csv output/resultats_queen_*.csv
-
-# Mode dry-run (vérification sans écriture)
-python3 reload_article_companies_notes.py --dry-run
-```
-
-#### Points clés :
-
-- ✅ Récupère notes depuis CSV (pas depuis API)
-- ✅ Supporte glob patterns pour plusieurs fichiers
-- ✅ Normalise les noms (majuscules, accents, espaces)
-- ✅ Mode --dry-run pour vérifier avant de committer
-- ⚠️ Nécessite que article_id + company_id existent en BDD
-
----
-
-### ✅ benchmark_classification.py
-
-**Rôle** : Compare la qualité des classifications entre différents modèles LLM
-
-**Objectif** : Mesurer qui est le meilleur (Haiku? Gemini? Ollama local?)
-
-#### Configuration de référence :
-
-```python
-BASELINE = "note_haiku"               # modèle de référence principal
-REFERENCE_SECONDAIRE = "note_gemini"  # 2e référence pour isoler les divergences
-
-MODELES_LOCAUX = ["note_llama3", "note_mistral", "note_queen"]
-```
-
-#### Métriques calculées :
-
-```python
-1. Accuracy (% de prédictions correctes vs baseline)
-2. Cohen's Kappa (accord inter-annotateurs)
-3. Confusion Matrix (quels cas sont mal classés?)
-4. Classification Report (precision, recall, F1-score)
-5. Heatmaps (visualisation des erreurs)
-```
-
-#### Flux :
-
-```python
-1. Charger DataFrame depuis BDD (article_companies)
-2. Filtrer par version de prompt (v1 a v4) depuis nom de fichier
-3. Exclure lignes avec statut != "ok" (failed ne compte pas)
-4. Comparer chaque modèle vs BASELINE
-   ├─ Haiku vs Gemini
-   ├─ Ollama local vs Haiku
-   └─ Ollama local vs Gemini
-5. Générer rapports + graphiques
-```
-
-#### Output :
-
-```
-📊 Graphiques (PNG/SVG)
-├─ Confusion matrices (heatmaps)
-├─ Accuracy comparatives
-└─ F1-score par classe
-
-📋 Rapports texte
-├─ Classification report (precision, recall)
-├─ Kappa scores (accord inter-raters)
-└─ Zones de divergence (où les modèles ne sont pas d'accord)
-```
-
-#### Usage :
-
-```bash
-python3 benchmark_classification.py
-```
-
-#### Points clés :
-
-- ✅ Compare LOCAL vs CLOUD automatiquement
-- ✅ Isole version de prompt (v1 a v4)
-- ✅ Génère graphiques professionnels (matplotlib/seaborn)
-- ✅ Utilise statut pour filtrer les vraies notes (pas les "failed")
-- ⚠️ Nécessite colonnes de statut (statut_lama, statut_haiku, etc.)
-
----
-
-### ✅ build_alias_db.py
-
-**Rôle** : Construit `alias.json` à partir des articles en BDD using Gemini LLM
-
-**Objectif** : Détecter TOUS les aliases, périphrases, surnoms que les journalistes utilisent pour parler de chaque entreprise
-
-#### Exemple :
-
-```
-Entreprise : "Air Liquide"
-Aliases trouvés : [
-  "AL",
-  "le leader du gaz",
-  "le géant français",
-  "le spécialiste des gaz industriels",
-  "l'équipementier historique",
-  ...
-]
-```
-
-#### Flux :
-
-```python
-1. Pour chaque entreprise :
-   a. SELECT 10 articles mentionnant cette entreprise
-   b. Préparer prompt Gemini avec ces articles
-   c. Appeler Gemini en JSON mode
-   d. Parser réponse → liste d'aliases
-2. Construire alias.json :
-   {
-     "Air Liquide": ["AL", "le leader du gaz", ...],
-     "Renault": ["Renault Group", "la marque au losange", ...],
-     ...
-   }
-3. Sauvegarder dans output/alias.json
-```
-
-#### Configuration :
-
-```python
-GOOGLE_API_KEY = charger depuis .env
-GEMINI_MODEL = "gemini-flash-latest"
-
-class ListeAlias(BaseModel):
-    alias: list[str]
-```
-
-#### Usage :
-
-```bash
-python3 build_alias_db.py
-```
-
-#### Points clés :
-
-- 💰 Payant (utilise API Gemini)
-- ✅ Automatise la détection d'aliases
-- ✅ Supprime le besoin de saisie manuelle
-- ⚠️ Qualité dépend du sample d'articles fournis (10 articles)
-- ✅ Schema Pydantic garantit format JSON correct
-
----
-
-### ✅ recuperer_batch_orphelin.py
-
-**Rôle** : Récupère les résultats de batches "orphelins" (soumis mais métadonnées perdues)
-
-**Contexte du problème** :
-- Vous lancez `--mode batch` pour Gemini
-- Pendant la soumission, une erreur 429 survient au milieu (ex: chunk 3/5)
-- Les chunks 1-2 étaient déjà soumis ET facturés
-- L'ancien code sortait AVANT d'écrire `batches_gemini_XXX.json`
-- Résultat : des batch_id tournent côté Google, mais aucun fichier local ne les relie aux articles
-- `--collect` devient impossible
-
-#### Solution :
-
-```python
-Flux de récupération :
-1. Lire batch_id depuis CLI (ex: "batch_123abc")
-2. Appeler Google API : client.batches.get(batch_id)
-3. Vérifier état = JOB_STATE_SUCCEEDED (sinon ignore et liste pour reprise)
-4. Lire fichier de résultats depuis GCS (job.dest.file_name)
-5. Extraire chaque custom_id depuis la colonne "key"
-6. Parser custom_id → (article_id, company_id)
-7. SELECT correspondant en BDD pour récupérer texte + métadonnées
-8. Reconstruire fichier métadonnées compatible :
-   {
-     "modele": "gemini",
-     "prompt_version": "v3",
-     "batches": [...],
-     "requetes": {...},  # article_id → texte
-   }
-9. Écrire output/batches_gemini_v3_YYYYMMDD_RECUPERE.json
-10. Proposer de lancer : python evaluate_article.py --collect <fichier>
-```
-
-#### Usage :
-
-```bash
-# Récupérer 1 batch
-python3 recuperer_batch_orphelin.py v3 "batch_XXXXXX"
-
-# Récupérer plusieurs batchs
-python3 recuperer_batch_orphelin.py v3 "batch_AAA" "batch_BBB" "batch_CCC"
-
-# Mode debug (inspecter structure du job)
-python3 recuperer_batch_orphelin.py v3 "batch_XXXXXX" --debug
-```
-
-#### Filtrage des batchs :
-
-```python
-ETATS_TERMINAUX = {
-    "JOB_STATE_SUCCEEDED",    # ✅ récupérable
-    "JOB_STATE_FAILED",       # ❌ pas de résultats
-    "JOB_STATE_CANCELLED",    # ❌ pas de résultats
-    "JOB_STATE_EXPIRED",      # ❌ pas de résultats
-}
-
-Les batchs NON terminaux sont listés pour reprise ultérieure
-```
-
-#### Points clés :
-
-- ✅ Récupère batches perdus
-- ✅ Supporte multiples batch_id en une commande
-- ✅ Mode debug pour diagnostiquer
-- ⚠️ Nécessite que batch soit en JOB_STATE_SUCCEEDED
-- ⚠️ Les articles doivent toujours exister en BDD
-- ✅ Output compatible avec `evaluate_article.py --collect`
-
----
-
-### ✅ verif__limit_batch.py
-
-**Rôle** : Diagnostic des jobs batch Gemini qui occupent la file d'attente
-
-**Problème résolu** :
-
-Vous recevez l'erreur :
-```
-429 RESOURCE_EXHAUSTED - "Token quota exceeded: 3M tokens queued"
-```
-
-Mais vous ne lancez rien en ce moment... pourquoi?
-
-**Réponse** : Des jobs batch antérieurs occupent ENCORE la file, même s'ils sont terminés!
-
-Gemini Batch API compte les tokens "mis en file d'attente" jusqu'à ce que le job atteigne un **état terminal**.
-
-#### États et quotas :
-
-```python
-ETATS_TERMINAUX = {
-    "JOB_STATE_SUCCEEDED",    # ✅ n'occupe PLUS la file
-    "JOB_STATE_FAILED",       # ✅ n'occupe PLUS la file
-    "JOB_STATE_CANCELLED",    # ✅ n'occupe PLUS la file
-    "JOB_STATE_EXPIRED",      # ✅ n'occupe PLUS la file
-}
-
-États NON terminaux (occupent la file) :
-    "JOB_STATE_UNSPECIFIED"
-    "JOB_STATE_QUEUED"
-    "JOB_STATE_RUNNING"
-    "JOB_STATE_PAUSED"
-```
-
-#### Flux :
-
-```python
-1. Charger GOOGLE_API_KEY depuis .env
-2. Appeler client.batches.list()
-3. Pour chaque batch :
-   a. Vérifier job.state
-   b. Afficher :
-      "->" si NON terminal (⚠️ occupe la file)
-      "  " si terminal (✅ libre)
-4. Compter combien de jobs NON-terminaux
-5. Si --annuler passé en argument :
-   a. Pour chaque job NON-terminal :
-      - Appeler client.batches.cancel(job.name)
-      - Afficher "Annulé : {job.name}"
-   b. Afficher "Attendez 1 minute pour la propagation"
-```
-
-#### Usage :
-
-```bash
-# Lister seulement
-python3 verif__limit_batch.py
-
-# Annuler les jobs non-terminaux
-python3 verif__limit_batch.py --annuler
-```
-
-#### Output exemple :
-
-```
-Clé API chargée : GOOG...XXXX (47 caractères)
-
-2 job(s) trouvé(s) :
-
-  JOB_STATE_SUCCEEDED  batch_ABC123  2026-08-14T10:00:00Z
--> JOB_STATE_RUNNING   batch_DEF456  2026-08-13T15:00:00Z
-
-1 job(s) NON terminal(aux) occupent encore votre quota de file d'attente.
-Relancez avec --annuler pour les annuler et libérer la file :
-    python verif__limit_batch.py --annuler
-```
-
-#### Points clés :
-
-- ✅ Diagnostic rapide des quotas
-- ✅ Lire sans toucher (mode par défaut)
-- ✅ Annuler les jobs qui traînent
-- ✅ Affiche créateur + timestamp de chaque job
-- ⚠️ Attention : pas de confirmation avant annulation
-- ✅ Masque la clé API pour la sécurité
-
----
-
-### ✅ verif_batch_haiku.py
-
-**Rôle** : Vérifier le statut des batchs Haiku (Anthropic)
-
-**Différence avec Gemini** :
-
-Contrairement à Gemini qui expose une liste centralisée des batchs via `client.batches.list()`,
-Anthropic n'offre pas de listing global. On récupère donc les batch_id depuis les fichiers 
-JSON de métadonnées sauvegardés localement (`output/batches_haiku_*.json`).
-
-#### Statuts Haiku :
-
-```python
-in_progress  → batch tourne encore côté Anthropic
-ended        → batch terminé, résultats disponibles
-unknown      → erreur de communication avec l'API
-```
-
-#### Flux :
-
-```python
-1. Scanner fichiers batches_haiku_*.json (ou patterns spécifiques)
-2. Extraire batch_id de chaque fichier
-3. Appeler API Anthropic pour chaque batch : GET /messages/batches/{batch_id}
-4. Afficher statut (in_progress / ended)
-5. Si ended → afficher request_counts (succès / erreurs)
-6. Proposer --collect si résultats disponibles
-```
-
-#### Usage :
-
-```bash
-# Tous les batchs Haiku locaux (par défaut)
-python3 verif_batch_haiku.py
-
-# Fichiers spécifiques (glob patterns)
-python3 verif_batch_haiku.py output/batches_haiku_v3_*.json
-
-# Plusieurs patterns
-python3 verif_batch_haiku.py output/batches_haiku_v3_*.json output/batches_haiku_v2_*.json
-
-# Batch_id direct
-python3 verif_batch_haiku.py msgbatch_XXXXXXXXXXXXXXXXXXXXXXXXX
-```
-
-#### Output exemple :
-
-```
-Clé API chargée : sk-ant-...XXXX (48 caractères)
-
-2 batch(s) trouvé(s) :
-
-→ in_progress    msgbatch_ABC123...
-   Créé : 2026-08-14T14:30:22Z
-   Source : output/batches_haiku_v3_20260814_143022.json
-   Requêtes : 500 succès, 0 erreurs
-
-  ended          msgbatch_DEF456...
-   Créé : 2026-08-14T12:00:00Z
-   Source : output/batches_haiku_v3_20260814_120000.json
-   Requêtes : 1000 succès, 5 erreurs
-   Results URL : https://...
-
-============================================================
-1 batch(s) ENCORE EN COURS (in_progress) :
-
-  • msgbatch_ABC123... (source: output/batches_haiku_v3_20260814_143022.json)
-    Progression: 500 succès | 0 en cours | 0 erreurs
-
-Attendez quelques heures ou relancez ce script plus tard.
-
-============================================================
-1 batch(s) TERMINÉ(S) :
-
-  • msgbatch_DEF456... (ended)
-    Résultats: 1000 succès | 5 erreurs
-    Results URL : https://...
-
-Pour récupérer les résultats, lancez :
-  python evaluate_article.py --collect output/batches_haiku_v3_20260814_120000.json
-```
-
-#### Workflow complet Haiku batch :
-
-```bash
-# 1. Soumettre batch
-python3 evaluate_article.py --modele haiku --prompt-version v3 --mode batch
-# Output : output/batches_haiku_v3_20260814_143022.json
-
-# 2. Vérifier statut (répétez toutes les heures)
-python3 verif_batch_haiku.py
-# Output : "in_progress" → attendez
-
-# 3. Quand "ended" s'affiche → récupérer résultats
-python3 evaluate_article.py --collect output/batches_haiku_v3_20260814_143022.json
-```
-
-#### Points clés :
-
-- ✅ Lit batch_id depuis fichiers JSON locaux
-- ✅ Pas besoin de listing centralisé (comme Gemini)
-- ✅ Support glob patterns
-- ✅ Support batch_id direct
-- ✅ Affiche progression (requêtes succès/erreurs)
-- ⚠️ Nécessite fichiers JSON de métadonnées (output/batches_haiku_*.json)
-- ✅ Propose automatiquement --collect quand résultats disponibles
-- ✅ Haiku batchs : généralement 2-24h (vs Gemini : jusqu'à 24h)
-
----
-
-## 📊 TABLEAU RÉCAPITULATIF UTILITAIRES
-
-| Programme | Rôle | Critique? | Pour |
-|-----------|------|-----------|------|
-| set_company_occurs.py | Calcul nbocc (word boundaries) | 🔴 OUI | Avant evaluate_article |
-| reload_article_companies_notes.py | Ré-import depuis CSV | 🟡 Optionnel | Récupérer anciennes notes |
-| benchmark_classification.py | Comparer qualité modèles | 🟡 Optionnel | Analyser résultats |
-| build_alias_db.py | Générer alias.json auto (Gemini) | 🟡 Optionnel | Détection aliases |
-| recuperer_batch_orphelin.py | Récupérer batchs perdus | 🟡 Urgence si besoin | Récupérer batchs Gemini orphelins |
-| verif__limit_batch.py | Diagnostic quota Gemini | 🟡 Urgence si 429 | Vérifier jobs Gemini |
-| verif_batch_haiku.py | Vérifier statut batchs Haiku | 🟡 Usage régulier | Vérifier jobs Haiku |
-
----
-
-
-
-### Lancement
-
-
-Recharger tous les resultats trouves dans `output/`:
-
-```bash
-uv run reload_article_companies_notes.py
-```
-
-Ce script recharge les notes dans `public.article_companies` a partir des fichiers deja exportes:
-- `output/resultats_gemini_*.csv`
-- `output/resultats_haiku_*.csv`
-- `output/resultats_mistral_*.csv`
-- `output/resultats_queen_*.csv`
-- `output/resultats_lama_*.csv` 
-
-Il evite de relancer les appels LLM: il relit les CSV puis met a jour la base directement.
-
-Recharger seulement certains lots:
-
-```bash
-uv run reload_article_companies_notes.py output/resultats_mistral_*.csv output/resultats_queen_*.csv output/resultats_gemini_*.csv
-```
-
-exemple :
-
-
-```bash
-uv run reload_article_companies_notes.py  --dry-run  output/resultats_gemini_20260709_204325.csv
-```
-
-Simulation sans ecriture en base:
-
-```bash
-uv run reload_article_companies_notes.py --dry-run
-```
-
-
-
-#### Prérequis
-
-Fichier `.env` à la racine :
-
-```
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=...
-DB_PASSWORD=...
-DB_NAME=...
-
-GOOGLE_API_KEY=...        # pour gemini
-ANTHROPIC_API_KEY=...     # pour haiku
-OLLAMA_URL=http://127.0.0.1:11434/api/generate   # pour les modeles locaux
-```
-
-Migration SQL à passer **une seule fois** (détaillée en tête de `evaluate_article.py`) :
-colonnes `statut_*` et `prompt_version_*`, suppression des contraintes `NOT NULL`
-et des `DEFAULT 0` sur les colonnes `note_*`.
-
-> Le `DEFAULT 0` est piégeux : sans lui, une ligne jamais évaluée naît avec la note 0,
-> c'est-à-dire NEGATIVE, indiscernable d'un vrai jugement négatif.
-
-### Lancement
-
-Le script est interactif : il demande le modèle, la version de prompt, puis le mode.
-
-```bash
+# 1. Évaluer les couples du périmètre (interactif : modèle, version de prompt, mode)
 python evaluate_article.py
+PROMPT_VERSION=v7 python evaluate_article.py          # run scripté
+
+# 2. Mode batch (Gemini, Haiku) : soumission, puis récupération plus tard
+python evaluate_article.py --collect output/batches_gemini_v7_<date>.json
+
+# 3. Historiser les notes, puis calculer le consensus
+python historique_notes.py --creer
+python historique_notes.py --amorcer --appliquer
+python note_consensus.py --creer-colonnes --appliquer
+python note_consensus.py                               # test à blanc
+
+# 4. Comparer les modèles entre eux
+python benchmark_classification.py
+
+# 5. Corpus et entraînement du transformer (expérimental)
+python preparer_corpus.py
+python entrainer_transformer.py
 ```
 
-Tout peut être piloté par variables d'environnement pour scripter les runs :
-
-```bash
-PROMPT_VERSION=v4 python evaluate_article.py
-BATCH_TAILLE_MAX=500 PROMPT_VERSION=v4 python evaluate_article.py
-```
-
-### Variables d'environnement
+Variables d'environnement utiles :
 
 | Variable | Défaut | Rôle |
-| --- | --- | --- |
-| `PROMPT_VERSION` | *(demandé)* | Version de prompt : `v1` à `v4` |
+|---|---|---|
+| `PROMPT_VERSION` | *(demandé)* | Version de prompt à utiliser |
 | `REPRENDRE` | `1` | `0` pour tout réévaluer, y compris ce qui est déjà fait |
-| `LIMITE_PAR_ENTREPRISE` | *(aucune)* | Limite le nombre d'articles par entreprise (tests) |
-| `BATCH_TAILLE_MAX` | `1000` | Nombre de requêtes par batch soumis |
+| `LIMITE_PAR_ENTREPRISE` | *(aucune)* | Plafond d'articles par entreprise, pour les tests |
+| `BATCH_TAILLE_MAX` | `1000` | Requêtes par batch soumis |
 | `RETRY_MAX_TENTATIVES` | `4` | Tentatives avant abandon sur erreur transitoire |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Modèle Gemini |
-| `HAIKU_MODEL` | `claude-haiku-4-5` | Modèle Anthropic |
+| `GEMINI_MODEL` / `HAIKU_MODEL` | `gemini-2.5-flash` / `claude-haiku-4-5` | Modèles distants |
+| `SEUIL_VARIATION_PCT` | `5.0` | Seuil de la règle « mouvement de cours seul » |
 
-### Versions de prompt
+Principes de fonctionnement à connaître :
 
-| Version | Contenu | Notes |
-| --- | --- | --- |
-| `v1` | Règles courtes, NEUTRAL par défaut en cas de doute | ⚠️ Baseline simple, biais NEUTRAL |
-| `v2` | Isolation des phrases pertinentes, few-shot, règle anti-repli-neutre | ✅ Amélioration : anti-biais NEUTRAL |
-| `v3` | v2 + règles sur les objectifs de cours et recommandations de brokers | ✅ Finance-spécifique |
-| `v4` | v3 corrigé : étape de lecture factuelle explicite + grille complète 3×4 | ✅ Grille structurée, meilleure accuracy |
-| `v5` | v4 + extraction structurée JSON (validation stricte) | 🆕 JSON-first, moins d'erreurs parsing |
-| `v6` | v5 + contexte boursier + règles sectorales | 🆕 Affiné par secteur (énergie, tech, etc.) |
-| `v7` | v6 + zero-shot vs few-shot variante | 🆕 Benchmark pour comparer approches |
+- **Les prompts sont immuables.** Toute évolution crée une nouvelle version dans le registre `PROMPTS` de `llm_common.py`. Le mécanisme de reprise compare la version stockée à celle demandée : modifier un prompt en place ferait croire que tout est à jour.
+- **Le LLM constate, le code décide.** À partir de la v6, le modèle extrait des faits (variation de cours, fait concret, recommandation d'analyste) et `note_finale()` applique en Python les règles déterministes, sans nouvel appel d'API.
+- **Un échec n'est jamais une note.** Le statut d'une évaluation suit `not_evaluated` → `submitted` → `ok` ou `failed` ; un `failed` est repris au run suivant.
+- **Les scripts utilitaires** (récupération de batchs orphelins, diagnostic de quota Gemini, suivi des batchs Haiku, rechargement depuis les CSV, construction des alias) sont décrits dans l'en-tête de chaque fichier.
 
-**Règle absolue : ne jamais modifier un prompt existant en place.** Toute évolution
-crée une nouvelle version. Le mécanisme de reprise compare la version stockée en base
-à celle demandée ; modifier `v4` sans le renommer ferait croire au script que tout est
-à jour alors que les notes proviennent d'un prompt différent.
+## Résultats clés
 
-### Modes d'exécution
+Mesurés contre 191 annotations humaines. Le test est volontairement biaisé vers les cas difficiles (131 désaccords Gemini/Haiku, 60 accords tirés au hasard) : il faut comparer les chiffres bruts entre eux, et lire les estimations repondérées comme un ordre de grandeur (marge d'erreur de 7 à 10 points).
 
-**`sync`** — appel immédiat, article par article. Seul mode disponible pour les modèles
-locaux. Les résultats sont écrits au fil de l'eau.
+| Mesure | Résultat |
+|---|---|
+| Accord Gemini / Haiku (prompt v7) | 79,9 %, kappa de Cohen 0,64 |
+| Meilleur modèle seul, estimé sur tout le périmètre | Haiku 78,8 % — Gemini 77,9 %, Llama 71,6 %, Qwen 71,0 %, Mistral 50,9 % |
+| **Consensus** (médiane Gemini + Haiku + Llama, v7) | **81,1 %** estimé sur le périmètre ; 67,5 % brut sur les 191 (Llama seul : 63,4 %) |
+| Consensus quand les trois modèles sont **unanimes** (61 % des couples) | **91,3 %** de justesse, contre 60,0 % sinon |
+| Transformer (CamemBERT) entraîné sur le consensus | 54,5 % sur le test humain, kappa 0,24 : non retenu |
 
-**`batch`** — réservé à Gemini et Haiku. Soumission par lot à **-50 % de coût**, avec un
-délai pouvant aller jusqu'à 24 h (en pratique 2 à 4 h). Se déroule en deux temps :
+Ce que ces chiffres disent : la combinaison de trois modèles bat n'importe quel modèle seul et n'importe quelle variation de prompt, et le désaccord entre modèles est le meilleur détecteur de difficulté disponible, gratuitement. Deux prompts plus détaillés (v8, v9) n'ont rien apporté de significatif.
 
-```bash
-# 1. Soumission (retour immédiat)
-PROMPT_VERSION=v4 python evaluate_article.py
-#    -> Métadonnées : output/batches_gemini_v4_20260814_084228.json
+## Pour aller plus loin
 
-# 2. Récupération (à relancer tant que des batchs sont en cours)
-python evaluate_article.py --collect output/batches_gemini_v4_20260814_084228.json
-```
+- Épisode 2 — [Construire sa vérité terrain : quel LLM local pour noter l'actualité boursière](https://aventuresdata.com/construire-sa-verite-terrain-quel-llm-local-pour-noter-lactualite-boursiere/)
+- Épisode 3 — *Entraîner un Transformer sur sa vérité terrain : ce que trois échecs nous apprennent* (à venir sur le blog)
+- Le README documente le code ; le blog documente la démarche, y compris les hypothèses réfutées en route.
 
-Le batch continue de tourner côté fournisseur même machine éteinte. La récupération
-est idempotente : les batchs déjà collectés sont ignorés.
+## Limites connues et feuille de route
 
-### Reprise automatique des runs interrompus
+**Limites assumées**
 
-Activée par défaut (`REPRENDRE=1`). Le script ne traite que les couples
-(article, entreprise) qui ne sont **pas** déjà en `statut = 'ok'` ou `'submitted'`
-**pour la version de prompt demandée**.
+- **Le transformer n'est pas prêt.** Avec 830 exemples d'entraînement jugés sûrs, CamemBERT imite le consensus sur les cas faciles (82,6 %) et le perd sur les cas litigieux (45,5 %). Le verrou est le volume d'étiquettes, pas le code : le projet attend plus d'annotations ou plusieurs mois de consensus sur les 68 sociétés suivies.
+- **Le consensus reste faible sur les cas litigieux** : 60 % de justesse quand les modèles divergent. Il faut relire en priorité les couples non unanimes.
+- **Les estimations sur le périmètre entier reposent sur 191 annotations**, d'où la marge d'erreur de 7 à 10 points.
+- **Le TF-IDF a été retiré de la chaîne quotidienne** le 20 septembre : son pouvoir de détection de difficulté est deux fois plus faible que celui de l'unanimité des modèles (écart de 17,4 points contre 31,3). Le code reste archivé.
+- **Pas de CI ni de suite de tests automatisés** sur le pipeline principal à ce jour.
+- **Docker partiel** : le `Dockerfile` et le `docker-compose.yml` ne couvrent que l'évaluation par Gemini et ne sont pas alignés sur la version de Python du projet (3.12 dans l'image, 3.13 requis par `pyproject.toml`).
 
-Concrètement, relancer après une coupure ne retraite que le reliquat. Changer de
-version de prompt réévalue tout, puisque les notes ne sont plus comparables.
+**Pistes**
 
-Cycle de vie du statut :
+- Élargir le jeu d'étiquettes dans le périmètre : annoter davantage, ou laisser s'accumuler le consensus quotidien.
+- Réentraîner le transformer une fois le volume suffisant, en conservant le test humain intact.
+- Porter côté production le rattachement des 34 sociétés ajoutées en local.
+- Aligner le rattachement des entreprises entre la production (recherche plein texte PostgreSQL) et le local (expressions régulières).
 
-```
-not_evaluated  ──►  submitted  ──►  ok
-                                └►  failed  ──► (repris au run suivant)
-```
+## Auteur
 
-`submitted` est écrit dès la soumission d'un batch : il empêche qu'un second run
-lancé pendant que le batch est en vol resoumette — et refacture — les mêmes articles.
+Manuel — data scientist / MLOps engineer, en transition vers un rôle de Data Product Manager. Blog : [aventuresdata.com](https://aventuresdata.com) · GitHub : [ManDes71](https://github.com/ManDes71)
 
-Pour forcer une réévaluation complète (ex. après correction d'un bug de parsing) :
-
-```bash
-REPRENDRE=0 PROMPT_VERSION=v4 python evaluate_article.py
-```
-
-### Sorties produites
-
-| Fichier | Contenu |
-| --- | --- |
-| `output/resultats_{modele}_{version}_{date}.csv` | Une ligne par évaluation : note, justification, statut, longueurs |
-| `output/log_articles_{modele}_{version}_{date}.txt` | Journal détaillé, y compris les articles filtrés |
-| `output/batches_{modele}_{version}_{date}.json` | Métadonnées de batch (mode batch uniquement) |
-
-La base ne conserve que le **dernier** état de chaque colonne. Pour comparer deux
-versions de prompt, il faut donc s'appuyer sur les CSV horodatés, pas sur la base.
-
-### Suivi et diagnostic
-
-```sql
--- Avancement par modèle
-SELECT statut_gemini, prompt_version_gemini, COUNT(*)
-FROM public.article_companies GROUP BY 1,2 ORDER BY 3 DESC;
-
--- Reste à traiter pour une version donnée
-SELECT COUNT(*)
-FROM public.article_companies ac
-JOIN public.articles_rss a ON a.id = ac.article_id
-WHERE a.contenu IS NOT NULL
-  AND (ac.statut_gemini IS DISTINCT FROM 'ok'
-       OR ac.prompt_version_gemini IS DISTINCT FROM 'v4');
-```
-
-
-
-
-### reinit d'ollama
-
-sudo systemctl stop ollama
-sudo pkill -f ollama
-sudo systemctl start ollama
-
-
+Licence : à définir (aucun fichier `LICENSE` dans le dépôt à ce jour).
