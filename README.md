@@ -1,6 +1,6 @@
 # Analyse de sentiment CAC 40 par LLM
 
-**Une note de sentiment fiable, entreprise par entreprise, pour les articles de presse financière — construite en mesurant ce que valent les modèles plutôt qu'en leur faisant confiance.**
+Pipeline d'evaluation du sentiment financier d'articles RSS par cinq modeles de langage (deux API distantes, trois modeles locaux), avec comparaison de leurs performances.
 
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-336791)
@@ -31,7 +31,7 @@
 
 Noter le sentiment d'un article sur une entreprise précise paraît simple, jusqu'à ce qu'on essaie de le mesurer. Un article sur la séance du CAC 40 cite dix valeurs et ne dit rien de chacune d'elles ; un modèle de langage lui attribue pourtant une note. Deux modèles cloud de premier plan ne s'accordent que dans 80 % des cas, et aucun n'est « la vérité ».
 
-Ce projet répond à une question de produit avant d'être une question de modèle : **comment obtenir une note de référence dont on connaît la fiabilité, au meilleur coût ?** Il part de flux RSS, décide quels couples (article, entreprise) méritent d'être notés, les fait noter par plusieurs LLM, et mesure le résultat contre 191 annotations humaines.
+Ce part de flux RSS, décide quels couples (article, entreprise) méritent d'être notés, les fait noter par plusieurs LLM, et mesure le résultat contre 191 annotations humaines.
 
 ## Ce que fait le projet
 
